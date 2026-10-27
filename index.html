@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Echo Defense — prototype (Schwarze Spiele)</title>
+<style>
+  html,body{margin:0;padding:0;background:#0b0d12;height:100%;overflow:hidden;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}
+  body{display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;touch-action:none;background:#151a22;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+// ================= CONFIG =================
+const params = new URLSearchParams(location.search);
+const FAST = params.has('fast') ? (parseFloat(params.get('fast')) > 1 ? parseFloat(params.get('fast')) : 3) : 1; // ?fast=1 -> 3x, ?fast=N -> Nx
+const W = 360, H = 720;
+const LANES = [60, 180, 300];
+const LN = ['LEFT', 'CENTER', 'RIGHT'];
+const FIELD_TOP = 92, WALL_Y = 556, WALL_H = 22, STOP_Y = WALL_Y - 12;
+const WAVES = 5, WAVE_DUR = 32, BREAK_DUR = 4;
+const WALL_MAX = 100, REPAIR_COST = 8, REPAIR_AMT = 20;
+const TOWER_BASE = 20, TOWER_STEP = 6, BUILD_TIME = 2.5;
+const ECHO_SHARE = [0.05, 0.10, 0.25, 0.30, 0.45];
+const CHECKPOINTS = [0, 0.35, 0.7];
+const TELEGRAPH = 2.5;
+const SPELLS = {
+  fireball: { name: 'Fireball', cd: 8,  color: '#ff7a2f', icon: '🔥' },
+  freeze:   { name: 'Freeze',   cd: 12, color: '#6fc8ff', icon: '❄' },
+  mend:     { name: 'Mend',     cd: 15, color: '#7dff8a', icon: '✚' },
+};
+const SPELL_KEYS = ['fireball', 'freeze', 'mend'];
+const SLOTS = [];
+LANES.forEach((cx, lane) => {
+  [[-40, 490], [40, 490], [-40, 400], [40, 400]].forEach(([dx, y]) => SLOTS.push({ x: cx + dx, y, lane }));
+});
+const STORE_KEY = 'echoDefense_v1';
+
+// ================= PERSISTENCE =================
+function loadSave() {
+  try { const s = JSON.parse(localStorage.getItem(STORE_KEY)); if (s && s.day) return s; } catch (e) {}
+  return { day: 1, profile: null };
+}
+function writeSave() { try { localStorage.setItem(STORE_KEY, JSON.stringify(save)); } catch (e) {} }
+let save = loadSave();
+
+// ================= CANVAS =================
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let scale = 1;
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  scale = Math.min(vw / W, vh / H);
+  const dpr = window.devicePixelRatio || 1;
+  cv.style.width = (W * scale) + 'px';
+  cv.style.height = (H * scale) + 'px';
+  cv.width = Math.round(W * scale * dpr);
+  cv.height = Math.round(H * scale * dpr);
+  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ================= STATE =================
+let screen = 'title'; // title | play | end | card
+let G = null;         // current run
+let buttons = [];     // [{x,y,w,h,fn}] for menu screens
+let lastResult = null;
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const laneOf = x => clamp(Math.floor(x / 120), 0, 2);
+const argmax = arr => arr.reduce((bi, v, i) => v > arr[bi] ? i : bi, 0);
+const argmin = arr => arr.reduce((bi, v, i) => v < arr[bi] ? i : bi, 0);
+
+function newRun() {
+  const profile = save.day > 1 ? save.profile : null;
+  G = {
+    day: save.day, profile, echoOn: !!profile,
+    time: 0, wave: 0, waveT: 0, phase: 'break', breakT: 2.5,
+    points: 40, towersBuilt: 0,
+    walls: [0, 1, 2].map(i => ({ hp: WALL_MAX, dmgSince: null, flash: 0 })),
+    towers: [], enemies: [], fx: [], tracers: [], queue: [],
+    spells: { fireball: 0, freeze: 0, mend: 0 }, armed: null,
+    keepCd: 0,
+    echo: { target: null, pending: null, cpIdx: 0, commits: [], banner: null },
+    commanderCast: false, msgs: [],
+    rec: { towers: [], repairs: [], spells: [], dmg: [0, 0, 0], unrepaired: [] },
+    over: false,
+  };
+  screen = 'play';
+}
+
+// ================= WAVES =================
+function buildWave(w) {
+  const n = 10 + w * 5, q = [];
+  const share = G.echoOn ? ECHO_SHARE[w] : 0;
+  for (let i = 0; i < n; i++) {
+    const t = 1 + i * (WAVE_DUR - 6) / n + rand(-0.3, 0.3);
+    let r = Math.random(), type = 'grunt';
+    if (w >= 1 && r < 0.3) type = 'runner';
+    else if (w >= 2 && r > 0.8) type = 'brute';
+    const echo = Math.random() < share;
+    if (echo && G.profile && G.profile.favTowerLane != null && Math.random() < 0.35) type = 'archer';
+    q.push({ t, type, echo });
+  }
+  // guarantee at least one echo from wave 3 on
+  if (G.echoOn && w >= 2 && !q.some(e => e.echo)) q[Math.floor(n / 2)].echo = true;
+  if (G.echoOn && w === WAVES - 1) q.push({ t: WAVE_DUR * 0.3, type: 'commander', echo: true });
+  q.sort((a, b) => a.t - b.t);
+  return q;
+}
+const TYPES = {
+  grunt:     { hp: 22,  speed: 30, dps: 6,  r: 9,  pts: 4,  color: '#d64b4b' },
+  runner:    { hp: 12,  speed: 56, dps: 3,  r: 7,  pts: 3,  color: '#e8a33b' },
+  brute:     { hp: 70,  speed: 17, dps: 12, r: 13, pts: 9,  color: '#9b3fc4' },
+  archer:    { hp: 18,  speed: 34, dps: 0,  r: 8,  pts: 6,  color: '#4bd6d6' },
+  commander: { hp: 380, speed: 11, dps: 20, r: 17, pts: 40, color: '#38f0ff' },
+};
+function spawn(e) {
+  const T = TYPES[e.type];
+  let lane;
+  if (e.echo) {
+    if (e.type === 'archer') lane = G.profile.favTowerLane;
+    else lane = G.echo.target != null ? G.echo.target : (G.echo.pending ? G.echo.pending.lane : weakestLane().lane);
+  } else lane = Math.floor(Math.random() * 3);
+  const hpMul = 1 + G.wave * 0.18;
+  G.enemies.push({
+    type: e.type, echo: e.echo, lane, x: LANES[lane] + rand(-12, 12), y: FIELD_TOP - 10,
+    hp: T.hp * hpMul, maxHp: T.hp * hpMul, speed: T.speed, dps: T.dps, r: T.r, pts: T.pts,
+    slowT: 0, atWall: false, fireT: 1, off: rand(-12, 12),
+  });
+  if (e.type === 'commander') msg('ECHO COMMANDER has arrived!', '#38f0ff');
+}
+
+// ================= ECHO BRAIN =================
+function towersInLane(i) { return G.towers.filter(t => t.lane === i && t.buildT <= 0 && t.hp > 0).length; }
+function weakestLane() {
+  const p = G.profile || {};
+  const minHp = Math.min(...G.walls.map(w => w.hp));
+  const cov = [0, 1, 2].map(towersInLane);
+  const minCov = Math.min(...cov);
+  const scores = [0, 1, 2].map(i => {
+    const parts = [];
+    const weak = (1 - G.walls[i].hp / WALL_MAX) * 60;
+    parts.push({ v: weak + (G.walls[i].hp === minHp && weak > 3 ? 8 : 0), why: 'lowest wall' });
+    parts.push({ v: Math.max(0, 3 - cov[i]) * 7 + (cov[i] === minCov ? 4 : 0), why: cov[i] === 0 ? 'no tower cover' : 'thin tower cover' });
+    if (p.slowRepairLane === i) parts.push({ v: 16, why: 'you repair it slowly' });
+    if (p.neglectedLane === i) parts.push({ v: 13, why: 'you neglect it' });
+    const total = parts.reduce((s, x) => s + x.v, 0) + rand(0, 3);
+    return { lane: i, total, parts: parts.sort((a, b) => b.v - a.v) };
+  });
+  const best = scores.reduce((a, b) => b.total > a.total ? b : a);
+  const reasons = best.parts.filter(x => x.v > 2).slice(0, 2).map(x => x.why);
+  if (!reasons.length) reasons.push('probing');
+  return { lane: best.lane, reason: reasons.join(' + ') };
+}
+function echoTick(dt) {
+  if (!G.echoOn || G.phase !== 'wave') return;
+  const E = G.echo;
+  if (E.cpIdx < CHECKPOINTS.length && G.waveT >= CHECKPOINTS[E.cpIdx] * WAVE_DUR) {
+    const wl = weakestLane();
+    E.pending = { lane: wl.lane, reason: wl.reason, t: TELEGRAPH };
+    E.cpIdx++;
+  }
+  if (E.pending) {
+    E.pending.t -= dt;
+    if (E.pending.t <= 0) {
+      E.target = E.pending.lane;
+      E.commits.push({ wave: G.wave + 1, lane: E.target, reason: E.pending.reason });
+      G.enemies.forEach(en => { if (en.echo && en.type !== 'archer' && !en.atWall) en.lane = E.target; });
+      E.pending = null;
+    }
+  }
+}
+function commanderCast(cmd) {
+  const spell = (G.profile && G.profile.favSpell) || 'fireball';
+  const lane = G.echo.target != null ? G.echo.target : cmd.lane;
+  if (spell === 'fireball') {
+    damageWall(lane, 18);
+    G.towers.forEach(t => { if (t.lane === lane) t.hp -= 30; });
+    G.fx.push({ type: 'boom', x: LANES[lane], y: WALL_Y - 20, r: 70, t: 0.6, color: '#38f0ff' });
+  } else if (spell === 'freeze') {
+    G.towers.forEach(t => { if (t.lane === lane) t.frozenT = 6; });
+    G.fx.push({ type: 'lane', lane, t: 1, color: '#38f0ff' });
+  } else {
+    G.enemies.forEach(e => { if (e.echo) e.hp = Math.min(e.maxHp, e.hp + e.maxHp * 0.5); });
+    G.fx.push({ type: 'boom', x: cmd.x, y: cmd.y, r: 90, t: 0.8, color: '#7dff8a' });
+  }
+  msg('Echo Commander casts YOUR ' + SPELLS[spell].name + '!', '#38f0ff');
+}
+
+// ================= ACTIONS =================
+function msg(text, color) { G.msgs.push({ text, color: color || '#fff', t: 2.5 }); if (G.msgs.length > 3) G.msgs.shift(); }
+function towerCost() { return TOWER_BASE + TOWER_STEP * G.towersBuilt; }
+function damageWall(i, d) {
+  const w = G.walls[i];
+  if (w.hp <= 0) return;
+  w.hp -= d; w.flash = 0.15; G.rec.dmg[i] += d;
+  if (w.dmgSince == null) w.dmgSince = G.time;
+  if (w.hp <= 0) { w.hp = 0; endRun(false, LN[i] + ' wall broke'); }
+}
+function repairWall(i) {
+  const w = G.walls[i];
+  if (w.hp >= WALL_MAX) { msg('Wall already full'); return; }
+  if (G.points < REPAIR_COST) { msg('Need ' + REPAIR_COST + ' pts to repair', '#f88'); return; }
+  G.points -= REPAIR_COST;
+  w.hp = Math.min(WALL_MAX, w.hp + REPAIR_AMT);
+  const delay = w.dmgSince != null ? G.time - w.dmgSince : 0;
+  G.rec.repairs.push({ lane: i, delay: +delay.toFixed(1), wave: G.wave + 1, t: +G.time.toFixed(1) });
+  w.dmgSince = w.hp >= WALL_MAX ? null : G.time;
+  G.fx.push({ type: 'text', x: LANES[i], y: WALL_Y - 14, text: '+' + REPAIR_AMT, t: 0.8, color: '#7dff8a' });
+}
+function buildTower(slotIdx) {
+  const s = SLOTS[slotIdx], cost = towerCost();
+  if (G.points < cost) { msg('Tower costs ' + cost + ' pts', '#f88'); return; }
+  G.points -= cost; G.towersBuilt++;
+  G.towers.push({ slot: slotIdx, lane: s.lane, x: s.x, y: s.y, buildT: BUILD_TIME, hp: 60, maxHp: 60, cd: 0, frozenT: 0 });
+  G.rec.towers.push({ lane: s.lane, wave: G.wave + 1, t: +G.time.toFixed(1), phase: G.phase === 'wave' ? +clamp(G.waveT / WAVE_DUR, 0, 1).toFixed(2) : 0 });
+}
+function recordSpell(key) {
+  G.rec.spells.push({ spell: key, wave: G.wave + 1, phase: G.phase === 'wave' ? +clamp(G.waveT / WAVE_DUR, 0, 1).toFixed(2) : 0 });
+  G.spells[key] = SPELLS[key].cd; G.armed = null;
+}
+function castFireball(x, y) {
+  G.enemies.forEach(e => { if (Math.hypot(e.x - x, e.y - y) < 55 + e.r) e.hp -= 45; });
+  G.fx.push({ type: 'boom', x, y, r: 55, t: 0.5, color: '#ff7a2f' });
+  recordSpell('fireball');
+}
+function castFreeze(lane) {
+  G.enemies.forEach(e => { if (e.lane === lane || laneOf(e.x) === lane) e.slowT = 5; });
+  G.fx.push({ type: 'lane', lane, t: 1, color: '#6fc8ff' });
+  recordSpell('freeze');
+}
+function castMend() {
+  G.walls.forEach((w, i) => { if (w.hp > 0) { w.hp = Math.min(WALL_MAX, w.hp + 15); if (w.hp >= WALL_MAX) w.dmgSince = null; } });
+  G.fx.push({ type: 'mend', t: 0.8 });
+  recordSpell('mend');
+}
+
+// ================= RECORDING -> PROFILE =================
+function finalizeRecording() {
+  G.walls.forEach((w, i) => { if (w.dmgSince != null && w.hp < WALL_MAX) G.rec.unrepaired.push({ lane: i, delay: +(G.time - w.dmgSince).toFixed(1) }); });
+}
+function buildProfile(rec) {
+  const avgDelay = [0, 1, 2].map(i => {
+    const ds = rec.repairs.filter(r => r.lane === i).map(r => r.delay)
+      .concat(rec.unrepaired.filter(r => r.lane === i).map(r => r.delay));
+    if (!ds.length) return rec.dmg[i] > 5 ? 30 : 0;
+    return ds.reduce((a, b) => a + b, 0) / ds.length;
+  });
+  const damaged = [0, 1, 2].filter(i => rec.dmg[i] > 5);
+  const slowRepairLane = damaged.length ? damaged.reduce((a, b) => avgDelay[b] > avgDelay[a] ? b : a) : null;
+  const towerCounts = [0, 1, 2].map(i => rec.towers.filter(t => t.lane === i).length);
+  const favTowerLane = rec.towers.length ? argmax(towerCounts) : null;
+  const repairCounts = [0, 1, 2].map(i => rec.repairs.filter(r => r.lane === i).length);
+  const attention = [0, 1, 2].map(i => towerCounts[i] * 2 + repairCounts[i] - rec.dmg[i] / 60);
+  const neglectedLane = argmin(attention);
+  const spellCounts = {}; rec.spells.forEach(s => spellCounts[s.spell] = (spellCounts[s.spell] || 0) + 1);
+  const favSpell = rec.spells.length ? Object.keys(spellCounts).reduce((a, b) => spellCounts[b] > spellCounts[a] ? b : a) : null;
+  const favPhases = favSpell ? rec.spells.filter(s => s.spell === favSpell).map(s => s.phase) : [];
+  const favSpellPhase = favPhases.length ? favPhases.reduce((a, b) => a + b, 0) / favPhases.length : 0.5;
+  const nm = s => s[0] + s.slice(1).toLowerCase();
+  const habits = [];
+  if (slowRepairLane != null) habits.push({ label: 'Slow ' + nm(LN[slowRepairLane]) + ' Repair', s: avgDelay[slowRepairLane] / 8,
+    detail: LN[slowRepairLane] + ' wall: avg ' + avgDelay[slowRepairLane].toFixed(1) + 's before repair' });
+  if (favTowerLane != null) {
+    const share = towerCounts[favTowerLane] / rec.towers.length;
+    habits.push({ label: nm(LN[favTowerLane]) + ' Stacker', s: (towerCounts[favTowerLane] >= 2 ? share * 2.2 : 0.4),
+      detail: towerCounts[favTowerLane] + ' of ' + rec.towers.length + ' towers in ' + LN[favTowerLane] });
+  }
+  if (favSpell) {
+    const when = favSpellPhase > 0.6 ? 'Late' : favSpellPhase < 0.3 ? 'Early' : 'Mid-wave';
+    habits.push({ label: SPELLS[favSpell].name + ' ' + when, s: Math.abs(favSpellPhase - 0.5) * 3 + spellCounts[favSpell] * 0.08,
+      detail: SPELLS[favSpell].name + ' x' + spellCounts[favSpell] + ', avg at ' + Math.round(favSpellPhase * 100) + '% of wave' });
+  }
+  habits.push({ label: nm(LN[neglectedLane]) + ' Neglecter', s: 0.9,
+    detail: LN[neglectedLane] + ' got the least towers/repairs' });
+  habits.sort((a, b) => b.s - a.s);
+  return {
+    signature: habits[0].label, habits, avgDelay: avgDelay.map(v => +v.toFixed(1)),
+    slowRepairLane, neglectedLane, favTowerLane, towerCounts, repairCounts,
+    favSpell, favSpellPhase: +favSpellPhase.toFixed(2), spellCounts, fromDay: save.day,
+  };
+}
+function endRun(win, reason) {
+  if (G.over) return;
+  G.over = true;
+  finalizeRecording();
+  const profile = buildProfile(G.rec);
+  const commitsByLane = [0, 1, 2].map(i => G.echo.commits.filter(c => c.lane === i));
+  const recap = [];
+  if (!G.echoOn) recap.push('Day ' + G.day + ': no Echo yet. This run is', 'the first recording.');
+  else if (!G.echo.commits.length) recap.push('The Echo never committed to a lane.');
+  else {
+    const top = argmax(commitsByLane.map(c => c.length));
+    const rs = {}; commitsByLane[top].forEach(c => c.reason.split(' + ').forEach(r => rs[r] = (rs[r] || 0) + 1));
+    const why = Object.keys(rs).sort((a, b) => rs[b] - rs[a]).slice(0, 2).join(' + ');
+    recap.push('Echo hit ' + LN[top] + ' ' + commitsByLane[top].length + 'x of ' + G.echo.commits.length + ' commits,');
+    recap.push('because: ' + why + '.');
+    if (G.commanderCast) recap.push('Commander used your ' + SPELLS[(G.profile.favSpell || 'fireball')].name + '.');
+  }
+  lastResult = { win, reason, recap, profile, rec: G.rec, day: G.day, wave: G.wave + 1, points: G.points };
+  screen = 'end';
+}
+function nextDay() {
+  save.profile = lastResult.profile;
+  save.day = lastResult.day + 1;
+  writeSave();
+  screen = 'card';
+}
+function resetAll() {
+  try { localStorage.removeItem(STORE_KEY); } catch (e) {}
+  save = { day: 1, profile: null }; lastResult = null; G = null; screen = 'title';
+}
+
+// ================= UPDATE =================
+function update(dt) {
+  if (screen !== 'play' || G.over) return;
+  G.time += dt;
+  for (const k of SPELL_KEYS) G.spells[k] = Math.max(0, G.spells[k] - dt);
+  G.walls.forEach(w => w.flash = Math.max(0, w.flash - dt));
+
+  if (G.phase === 'break') {
+    G.breakT -= dt;
+    if (G.breakT <= 0) {
+      G.phase = 'wave'; G.waveT = 0; G.queue = buildWave(G.wave);
+      G.echo.cpIdx = 0; G.echo.pending = null;
+      msg('Wave ' + (G.wave + 1) + ' begins', '#ffd34d');
+    }
+  } else {
+    G.waveT += dt;
+    while (G.queue.length && G.queue[0].t <= G.waveT) spawn(G.queue.shift());
+    echoTick(dt);
+    if (G.waveT >= WAVE_DUR * 0.4 && !G.queue.length && !G.enemies.length) {
+      G.wave++;
+      if (G.wave >= WAVES) { endRun(true, 'All ' + WAVES + ' waves cleared'); return; }
+      G.phase = 'break'; G.breakT = BREAK_DUR; G.echo.target = null; G.echo.pending = null;
+      G.points += 10; msg('Wave cleared! +10 pts', '#7dff8a');
+    }
+  }
+
+  // enemies
+  for (const e of G.enemies) {
+    const sp = e.speed * (e.slowT > 0 ? 0.4 : 1);
+    e.slowT = Math.max(0, e.slowT - dt);
+    const tx = LANES[e.lane] + e.off;
+    e.x += clamp(tx - e.x, -60 * dt, 60 * dt);
+    if (e.type === 'archer') {
+      if (e.y < 300) e.y += sp * dt;
+      else {
+        e.fireT -= dt;
+        if (e.fireT <= 0) {
+          e.fireT = 1.6;
+          const tw = G.towers.filter(t => t.hp > 0 && Math.abs(t.x - e.x) < 140).sort((a, b) => Math.hypot(a.x - e.x, a.y - e.y) - Math.hypot(b.x - e.x, b.y - e.y))[0];
+          if (tw) { tw.hp -= 7; G.tracers.push({ x1: e.x, y1: e.y, x2: tw.x, y2: tw.y, t: 0.15, c: '#38f0ff' }); }
+          else { damageWall(e.lane, 5); G.tracers.push({ x1: e.x, y1: e.y, x2: e.x, y2: WALL_Y, t: 0.15, c: '#38f0ff' }); }
+        }
+      }
+    } else if (e.y < STOP_Y - e.r) {
+      e.y += sp * dt; e.atWall = false;
+    } else {
+      e.atWall = true;
+      damageWall(laneOf(e.x), e.dps * dt * (e.slowT > 0 ? 0.5 : 1));
+      if (G.over) return;
+    }
+    if (e.type === 'commander' && !G.commanderCast && G.waveT / WAVE_DUR >= Math.max(0.4, G.profile.favSpellPhase || 0.5)) {
+      G.commanderCast = true; commanderCast(e);
+    }
+  }
+  // towers
+  G.towers = G.towers.filter(t => { if (t.hp <= 0) { msg(LN[t.lane] + ' tower destroyed', '#f88'); return false; } return true; });
+  for (const t of G.towers) {
+    if (t.buildT > 0) { t.buildT -= dt; continue; }
+    if (t.frozenT > 0) { t.frozenT -= dt; continue; }
+    t.cd -= dt;
+    if (t.cd <= 0) {
+      let best = null, bd = 1e9;
+      for (const e of G.enemies) {
+        const d = Math.hypot(e.x - t.x, e.y - t.y);
+        const score = d + (laneOf(e.x) === t.lane ? 0 : 60);
+        if (d < 165 && score < bd) { bd = score; best = e; }
+      }
+      if (best) { best.hp -= 8; t.cd = 0.85; G.tracers.push({ x1: t.x, y1: t.y, x2: best.x, y2: best.y, t: 0.1, c: '#ffe08a' }); }
+    }
+  }
+  // keep's weak auto-bolt
+  G.keepCd -= dt;
+  if (G.keepCd <= 0) {
+    const tgt = G.enemies.filter(e => e.y > 260).sort((a, b) => b.y - a.y)[0];
+    if (tgt) { tgt.hp -= 5; G.keepCd = 1.3; G.tracers.push({ x1: 180, y1: 600, x2: tgt.x, y2: tgt.y, t: 0.1, c: '#fff' }); }
+  }
+  // deaths
+  G.enemies = G.enemies.filter(e => {
+    if (e.hp > 0) return true;
+    G.points += e.pts;
+    G.fx.push({ type: 'text', x: e.x, y: e.y, text: '+' + e.pts, t: 0.7, color: e.echo ? '#38f0ff' : '#ffd34d' });
+    if (e.type === 'commander') msg('Echo Commander defeated!', '#38f0ff');
+    return false;
+  });
+  G.fx = G.fx.filter(f => (f.t -= dt) > 0);
+  G.tracers = G.tracers.filter(f => (f.t -= dt) > 0);
+  G.msgs = G.msgs.filter(m => (m.t -= dt) > 0);
+}
+
+// ================= INPUT =================
+function spellBtnRect(i) { return { x: 8 + i * 116, y: 648, w: 112, h: 60 }; }
+function onTap(x, y) {
+  if (screen !== 'play') {
+    for (const b of buttons) if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { b.fn(); return; }
+    return;
+  }
+  if (G.over) return;
+  // spell buttons
+  for (let i = 0; i < 3; i++) {
+    const r = spellBtnRect(i), k = SPELL_KEYS[i];
+    if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+      if (G.spells[k] > 0) { msg(SPELLS[k].name + ' on cooldown'); return; }
+      if (k === 'mend') castMend();
+      else G.armed = G.armed === k ? null : k;
+      return;
+    }
+  }
+  if (G.armed && y > FIELD_TOP && y < WALL_Y + WALL_H) {
+    if (G.armed === 'fireball') castFireball(x, y); else castFreeze(laneOf(x));
+    return;
+  }
+  // tower slots
+  for (let i = 0; i < SLOTS.length; i++) {
+    const s = SLOTS[i];
+    if (Math.abs(x - s.x) < 20 && Math.abs(y - s.y) < 20) {
+      if (G.towers.some(t => t.slot === i)) msg('Slot taken'); else buildTower(i);
+      return;
+    }
+  }
+  // walls (generous hit area)
+  if (y > WALL_Y - 26 && y < WALL_Y + WALL_H + 30) { repairWall(laneOf(x)); return; }
+  if (G.armed) G.armed = null;
+}
+cv.addEventListener('pointerdown', ev => {
+  ev.preventDefault();
+  const r = cv.getBoundingClientRect();
+  onTap((ev.clientX - r.left) / scale, (ev.clientY - r.top) / scale);
+}, { passive: false });
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+
+// ================= DRAW =================
+function txt(s, x, y, size, color, align, bold) {
+  ctx.fillStyle = color || '#fff';
+  ctx.font = (bold ? 'bold ' : '') + (size || 14) + 'px -apple-system,Helvetica,Arial,sans-serif';
+  ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText(s, x, y);
+}
+function rrect(x, y, w, h, r, fill, stroke) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); }
+}
+function button(label, x, y, w, h, fn, color) {
+  rrect(x, y, w, h, 10, color || '#2f6df6');
+  txt(label, x + w / 2, y + h / 2, 17, '#fff', 'center', true);
+  buttons.push({ x, y, w, h, fn });
+}
+function wrapLines(s, maxW, size) {
+  ctx.font = size + 'px -apple-system,Helvetica,Arial,sans-serif';
+  const words = s.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (ctx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur); return lines;
+}
+
+function drawPlay() {
+  const now = performance.now() / 1000;
+  // lanes
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = i % 2 ? '#1b222c' : '#182029';
+    ctx.fillRect(i * 120, FIELD_TOP, 120, WALL_Y - FIELD_TOP);
+    ctx.fillStyle = '#232c38'; ctx.fillRect(LANES[i] - 22, FIELD_TOP, 44, WALL_Y - FIELD_TOP);
+  }
+  // echo telegraph / target
+  const E = G.echo;
+  if (E.pending) {
+    const a = 0.18 + 0.15 * Math.sin(now * 12);
+    ctx.fillStyle = 'rgba(56,240,255,' + a + ')'; ctx.fillRect(E.pending.lane * 120, FIELD_TOP, 120, WALL_Y - FIELD_TOP);
+  }
+  if (E.target != null && G.phase === 'wave') {
+    ctx.strokeStyle = 'rgba(56,240,255,0.7)'; ctx.lineWidth = 3; ctx.setLineDash([8, 6]);
+    ctx.strokeRect(E.target * 120 + 3, FIELD_TOP + 3, 114, WALL_Y - FIELD_TOP - 6); ctx.setLineDash([]);
+  }
+  // lane fx
+  for (const f of G.fx) if (f.type === 'lane') { ctx.fillStyle = f.color; ctx.globalAlpha = f.t * 0.35; ctx.fillRect(f.lane * 120, FIELD_TOP, 120, WALL_Y - FIELD_TOP); ctx.globalAlpha = 1; }
+  // slots
+  SLOTS.forEach((s, i) => {
+    if (!G.towers.some(t => t.slot === i)) {
+      ctx.strokeStyle = G.points >= towerCost() ? '#5a6b80' : '#3a4350'; ctx.lineWidth = 2; ctx.setLineDash([4, 4]);
+      ctx.strokeRect(s.x - 15, s.y - 15, 30, 30); ctx.setLineDash([]);
+      txt('+', s.x, s.y + 1, 16, '#5a6b80', 'center');
+    }
+  });
+  // towers
+  for (const t of G.towers) {
+    if (t.buildT > 0) {
+      ctx.strokeStyle = '#c9a25a'; ctx.lineWidth = 2;
+      for (let k = -12; k <= 12; k += 8) { ctx.beginPath(); ctx.moveTo(t.x + k, t.y - 15); ctx.lineTo(t.x + k, t.y + 15); ctx.stroke(); }
+      ctx.beginPath(); ctx.moveTo(t.x - 15, t.y - 15); ctx.lineTo(t.x + 15, t.y + 15); ctx.moveTo(t.x + 15, t.y - 15); ctx.lineTo(t.x - 15, t.y + 15); ctx.stroke();
+      const p = 1 - t.buildT / BUILD_TIME;
+      ctx.fillStyle = '#333'; ctx.fillRect(t.x - 15, t.y + 18, 30, 4); ctx.fillStyle = '#c9a25a'; ctx.fillRect(t.x - 15, t.y + 18, 30 * p, 4);
+    } else {
+      rrect(t.x - 14, t.y - 14, 28, 28, 4, t.frozenT > 0 ? '#5aa9d6' : '#8a7350', '#d9c08a');
+      ctx.beginPath(); ctx.arc(t.x, t.y, 6, 0, 7); ctx.fillStyle = '#3b2f1e'; ctx.fill();
+      ctx.fillStyle = '#300'; ctx.fillRect(t.x - 14, t.y + 17, 28, 3); ctx.fillStyle = '#6f6'; ctx.fillRect(t.x - 14, t.y + 17, 28 * t.hp / t.maxHp, 3);
+    }
+  }
+  // enemies
+  for (const e of G.enemies) {
+    ctx.globalAlpha = e.echo ? 0.6 : 1;
+    ctx.beginPath();
+    if (e.type === 'archer') { ctx.moveTo(e.x, e.y + e.r); ctx.lineTo(e.x - e.r, e.y - e.r); ctx.lineTo(e.x + e.r, e.y - e.r); ctx.closePath(); }
+    else if (e.type === 'brute' || e.type === 'commander') ctx.rect(e.x - e.r, e.y - e.r, e.r * 2, e.r * 2);
+    else ctx.arc(e.x, e.y, e.r, 0, 7);
+    ctx.fillStyle = e.echo ? '#38f0ff' : TYPES[e.type].color; ctx.fill();
+    if (e.echo) { ctx.strokeStyle = '#d8fdff'; ctx.lineWidth = 1.5; ctx.stroke(); }
+    if (e.slowT > 0) { ctx.strokeStyle = '#6fc8ff'; ctx.lineWidth = 3; ctx.stroke(); }
+    ctx.globalAlpha = 1;
+    if (e.type === 'commander') txt('COMMANDER', e.x, e.y - e.r - 12, 10, '#38f0ff', 'center', true);
+    if (e.hp < e.maxHp) { ctx.fillStyle = '#400'; ctx.fillRect(e.x - e.r, e.y - e.r - 6, e.r * 2, 3); ctx.fillStyle = '#f55'; ctx.fillRect(e.x - e.r, e.y - e.r - 6, e.r * 2 * e.hp / e.maxHp, 3); }
+  }
+  // tracers
+  for (const t of G.tracers) { ctx.strokeStyle = t.c; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(t.x1, t.y1); ctx.lineTo(t.x2, t.y2); ctx.stroke(); }
+  // walls
+  G.walls.forEach((w, i) => {
+    const x = i * 120 + 4, ww = 112, p = w.hp / WALL_MAX;
+    rrect(x, WALL_Y, ww, WALL_H, 4, w.flash > 0 ? '#ff6b6b' : '#6b6f7a', '#9aa0ad');
+    ctx.fillStyle = p > 0.5 ? '#5fd35f' : p > 0.25 ? '#e8c23b' : '#e84b3b';
+    ctx.fillRect(x + 4, WALL_Y + WALL_H - 6, (ww - 8) * p, 3);
+    txt(Math.ceil(w.hp) + '', x + ww / 2, WALL_Y + 8, 12, '#fff', 'center', true);
+  });
+  // keep
+  rrect(120, 588, 120, 48, 6, '#4a4f5c', '#9aa0ad');
+  txt('KEEP', 180, 612, 13, '#cfd3dc', 'center', true);
+  txt('tap wall = repair (' + REPAIR_COST + ')', 60, 612, 9, '#8892a0', 'center');
+  txt('tower: ' + towerCost() + ' pts', 300, 612, 10, '#8892a0', 'center');
+  // fx
+  for (const f of G.fx) {
+    if (f.type === 'boom') { ctx.globalAlpha = Math.min(1, f.t * 2); ctx.beginPath(); ctx.arc(f.x, f.y, f.r * (1.2 - f.t), 0, 7); ctx.fillStyle = f.color; ctx.globalAlpha *= 0.4; ctx.fill(); ctx.globalAlpha = 1; }
+    if (f.type === 'text') { txt(f.text, f.x, f.y - (0.8 - f.t) * 25, 12, f.color, 'center', true); }
+    if (f.type === 'mend') { ctx.fillStyle = 'rgba(125,255,138,' + f.t * 0.4 + ')'; ctx.fillRect(0, WALL_Y - 4, W, WALL_H + 8); }
+  }
+  // HUD
+  ctx.fillStyle = '#0e1218'; ctx.fillRect(0, 0, W, FIELD_TOP);
+  txt('Day ' + G.day, 10, 16, 14, '#cfd3dc', 'left', true);
+  txt('Wave ' + Math.min(G.wave + 1, WAVES) + '/' + WAVES, 180, 16, 15, '#ffd34d', 'center', true);
+  txt('⬢ ' + G.points + ' pts', 350, 16, 15, '#ffd34d', 'right', true);
+  const status = G.phase === 'break' ? 'Next wave in ' + Math.ceil(G.breakT) + 's — build now!' : 'Wave time ' + Math.floor(G.waveT) + 's';
+  txt(status, 10, 38, 11, '#8892a0');
+  txt('Walls ' + G.walls.map(w => Math.ceil(w.hp)).join(' / '), 350, 38, 11, '#8892a0', 'right');
+  if (!G.echoOn) txt('No Echo today — you are being recorded', 180, 62, 12, '#8892a0', 'center');
+  else if (E.pending) {
+    const lines = wrapLines('Echo targets ' + LN[E.pending.lane] + ': ' + E.pending.reason, 340, 12);
+    lines.slice(0, 2).forEach((l, i) => txt(l, 180, 56 + i * 15, 12, '#38f0ff', 'center', true));
+  } else if (E.target != null && G.phase === 'wave') txt('Echo committed: ' + LN[E.target], 180, 62, 12, '#38f0ff', 'center', true);
+  else txt('Echo of ' + (G.profile.signature) + ' is watching…', 180, 62, 12, '#38f0ff', 'center');
+  // msgs
+  G.msgs.forEach((m, i) => txt(m.text, 180, 110 + i * 18, 13, m.color, 'center', true));
+  // armed hint
+  if (G.armed) txt(G.armed === 'fireball' ? 'Tap the field to drop Fireball' : 'Tap a lane to Freeze it', 180, 530, 13, SPELLS[G.armed].color, 'center', true);
+  // spell bar
+  ctx.fillStyle = '#0e1218'; ctx.fillRect(0, 640, W, 80);
+  SPELL_KEYS.forEach((k, i) => {
+    const r = spellBtnRect(i), S = SPELLS[k], cd = G.spells[k];
+    rrect(r.x, r.y, r.w, r.h, 10, cd > 0 ? '#262b33' : '#2c3542', G.armed === k ? '#fff' : S.color);
+    if (cd > 0) { ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(r.x + 2, r.y + 2, (r.w - 4) * cd / S.cd, r.h - 4); }
+    txt(S.icon + ' ' + S.name, r.x + r.w / 2, r.y + 22, 14, cd > 0 ? '#777' : S.color, 'center', true);
+    txt(cd > 0 ? cd.toFixed(1) + 's' : (k === 'mend' ? 'heal walls' : 'ready'), r.x + r.w / 2, r.y + 43, 11, '#aab', 'center');
+  });
+}
+
+function drawTitle() {
+  txt('ECHO DEFENSE', 180, 120, 34, '#38f0ff', 'center', true);
+  txt('Schwarze Spiele — prototype', 180, 155, 13, '#8892a0', 'center');
+  txt('Day ' + save.day, 180, 215, 24, '#fff', 'center', true);
+  if (save.day === 1 || !save.profile) {
+    ['No Echo yet. Play a run — everything you', 'do is recorded. Tomorrow, your Echo', 'attacks where you are weakest.'].forEach((l, i) => txt(l, 180, 260 + i * 20, 13, '#cfd3dc', 'center'));
+  } else echoCard(250);
+  button('START DAY ' + save.day, 80, 480, 200, 54, () => newRun(), '#2f6df6');
+  button('Reset (clear save)', 100, 560, 160, 40, () => resetAll(), '#5a2a2a');
+  ['Tap empty [+] slot: build archer tower', 'Tap a wall: repair it', 'Spells: Fireball (tap spot), Freeze (tap lane), Mend'].forEach((l, i) => txt(l, 180, 630 + i * 18, 11, '#8892a0', 'center'));
+}
+function echoCard(y) {
+  const p = save.profile;
+  rrect(30, y, 300, 200, 12, '#10262c', '#38f0ff');
+  txt("Today's Echo:", 180, y + 24, 14, '#8fdde6', 'center');
+  txt(p.signature, 180, y + 52, 22, '#38f0ff', 'center', true);
+  p.habits.slice(0, 4).forEach((h, i) => txt('• ' + h.detail, 44, y + 88 + i * 20, 11, '#cfe', 'left'));
+  txt('Echo squads grow each wave; Commander in wave 5.', 180, y + 180, 11, '#8fdde6', 'center');
+}
+function drawEnd() {
+  const r = lastResult;
+  ctx.fillStyle = 'rgba(8,10,14,0.95)'; ctx.fillRect(0, 0, W, H);
+  txt(r.win ? 'VICTORY' : 'DEFEAT', 180, 70, 34, r.win ? '#7dff8a' : '#ff6b6b', 'center', true);
+  txt(r.reason + ' (Day ' + r.day + ', wave ' + Math.min(r.wave, WAVES) + ')', 180, 104, 12, '#cfd3dc', 'center');
+  txt('Why the Echo hit there', 20, 140, 15, '#38f0ff', 'left', true);
+  r.recap.forEach((l, i) => txt(l, 20, 164 + i * 18, 12, '#cfe', 'left'));
+  txt('Your recorded habits', 20, 240, 15, '#ffd34d', 'left', true);
+  const p = r.profile, rec = r.rec;
+  const lines = [
+    'Towers: ' + (rec.towers.length ? rec.towers.map(t => LN[t.lane][0] + '@w' + t.wave).join(' ') : 'none'),
+    'Repairs per lane L/C/R: ' + p.repairCounts.join(' / '),
+    'Avg repair delay L/C/R: ' + p.avgDelay.map(v => v + 's').join(' / '),
+    'Damage taken L/C/R: ' + rec.dmg.map(v => Math.round(v)).join(' / '),
+    'Spells: ' + (rec.spells.length ? Object.entries(p.spellCounts).map(([k, v]) => SPELLS[k].name + ' x' + v).join(', ') : 'none'),
+    p.favSpell ? 'Fav spell ' + SPELLS[p.favSpell].name + ' at ~' + Math.round(p.favSpellPhase * 100) + '% of wave' : 'No favourite spell',
+    'Neglected lane: ' + LN[p.neglectedLane],
+    'Slow-repair lane: ' + (p.slowRepairLane != null ? LN[p.slowRepairLane] : '—'),
+  ];
+  lines.forEach((l, i) => wrapLines(l, 320, 12).slice(0, 1).forEach(s => txt(s, 20, 266 + i * 19, 12, '#cfd3dc')));
+  txt('Signature habit: ' + p.signature, 180, 440, 15, '#38f0ff', 'center', true);
+  button('NEXT DAY ▸', 70, 480, 220, 56, () => nextDay(), '#1f8a9a');
+  button('Reset (clear save)', 100, 555, 160, 40, () => resetAll(), '#5a2a2a');
+  txt('Next Day = overnight refresh: builds your Echo', 180, 620, 11, '#8892a0', 'center');
+}
+function drawCard() {
+  txt('— OVERNIGHT —', 180, 120, 18, '#8892a0', 'center', true);
+  txt('Day ' + save.day, 180, 170, 30, '#fff', 'center', true);
+  echoCard(220);
+  button('START DAY ' + save.day, 80, 480, 200, 54, () => newRun(), '#2f6df6');
+  button('Reset (clear save)', 100, 560, 160, 40, () => resetAll(), '#5a2a2a');
+}
+function draw() {
+  buttons = [];
+  ctx.fillStyle = '#151a22'; ctx.fillRect(0, 0, W, H);
+  if (screen === 'title') drawTitle();
+  else if (screen === 'card') drawCard();
+  else { drawPlay(); if (screen === 'end') drawEnd(); }
+}
+
+// ================= LOOP =================
+let last = performance.now();
+function frame(now) {
+  let real = Math.min(0.05, (now - last) / 1000); last = now;
+  let sim = real * FAST;
+  try {
+    while (sim > 0) { const s = Math.min(sim, 1 / 60); update(s); sim -= s; }
+    draw();
+  } catch (err) { console.error(err); }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+// test hooks
+window.ED = { get G() { return G; }, get screen() { return screen; }, get save() { return save; }, tap: onTap, SLOTS, FAST };
+</script>
+</body>
+</html>
