@@ -4,655 +4,469 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>Echo Defense — prototype (Schwarze Spiele)</title>
+<title>Echo Defense — Tower prototype v0.9 (Schwarze Spiele)</title>
 <style>
-  html,body{margin:0;padding:0;background:#0b0d12;height:100%;overflow:hidden;
+  html,body{margin:0;padding:0;background:#0b0d12;color:#dde3ee;font:14px/1.3 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;
     -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}
-  body{display:flex;align-items:center;justify-content:center;}
-  canvas{display:block;touch-action:none;background:#151a22;}
+  #wrap{max-width:560px;margin:0 auto;padding:6px 6px calc(10px + env(safe-area-inset-bottom));}
+  #top{display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap}
+  #top b{font-size:16px}
+  #hud{font-weight:600}
+  #readout{margin:4px 0;padding:4px 8px;border-radius:6px;background:#2a1d10;color:#ffd166;font-weight:600}
+  #how{font-size:12px;color:#9aa6b8;margin:2px 0 4px}
+  canvas{display:block;touch-action:none;background:#151a22;margin:0 auto;border-radius:8px;max-width:100%}
+  #msg{min-height:18px;margin:4px 0;font-size:13px;color:#cfe3ff}
+  #tools{display:flex;flex-wrap:wrap;gap:5px}
+  button{font:inherit;font-size:13px;min-height:40px;padding:6px 10px;border-radius:8px;border:1px solid #3a4558;background:#1f2633;color:#e6ecf5}
+  button.on{background:#3b5bdb;border-color:#748ffc}
+  button.go{background:#2b8a3e;border-color:#51cf66;font-weight:700}
+  button:disabled{opacity:.4}
+  #restart{background:#5c1f1f;border-color:#a33}
 </style>
 </head>
 <body>
-<canvas id="c"></canvas>
+<div id="wrap">
+  <div id="top"><b>Echo Defense</b><span id="hud"></span><button id="restart">Restart</button></div>
+  <div id="how">How to play: build walls (tap a side) and turrets (tap a ring dot) once, then survive 5 hordes. Creatures that break a defense get a <span style="color:#ffd166">yellow ring</span> and tell their neighbours; between rounds patch, move turrets onto known gaps to make rumors stale, and move armies.</div>
+  <div id="readout"></div>
+  <canvas id="c"></canvas>
+  <div id="msg"></div>
+  <div id="tools"></div>
+</div>
 <script>
 "use strict";
 // ================= CONFIG =================
 const params = new URLSearchParams(location.search);
-const FAST = params.has('fast') ? (parseFloat(params.get('fast')) > 1 ? parseFloat(params.get('fast')) : 3) : 1; // ?fast=1 -> 3x, ?fast=N -> Nx
-const W = 360, H = 720;
-const LANES = [60, 180, 300];
-const LN = ['LEFT', 'CENTER', 'RIGHT'];
-const FIELD_TOP = 92, WALL_Y = 556, WALL_H = 22, STOP_Y = WALL_Y - 12;
-const WAVES = 5, WAVE_DUR = 32, BREAK_DUR = 4;
-const WALL_MAX = 100, REPAIR_COST = 8, REPAIR_AMT = 20;
-const TOWER_BASE = 20, TOWER_STEP = 6, BUILD_TIME = 2.5;
-const ECHO_SHARE = [0.05, 0.10, 0.25, 0.30, 0.45];
-const CHECKPOINTS = [0, 0.35, 0.7];
-const TELEGRAPH = 2.5;
-const SPELLS = {
-  fireball: { name: 'Fireball', cd: 8,  color: '#ff7a2f', icon: '🔥' },
-  freeze:   { name: 'Freeze',   cd: 12, color: '#6fc8ff', icon: '❄' },
-  mend:     { name: 'Mend',     cd: 15, color: '#7dff8a', icon: '✚' },
+const FAST = params.has('fast') ? (parseFloat(params.get('fast')) > 0 ? parseFloat(params.get('fast')) : 3) : 1; // ?fast=N -> N x speed
+let seed = params.has('seed') ? (parseInt(params.get('seed')) || 1) : (Math.random() * 1e9) | 0;
+function rnd() { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }
+
+const WORLD = 560, C = WORLD / 2;
+const SIDES = 8, SA = Math.PI * 2 / SIDES;
+const SIDE_NAMES = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+const TOWER_R = 24, WALL_R = 90, SLOT_R = 128, ARMY_R = 165, SPAWN_R = 270, ORBIT_R = 175, INNER_R = 60;
+const TILE = 20, RUMOR_R = 2 * TILE;          // creatures within ~2 tiles learn
+const ROUNDS = 5;
+const HORDE = [40, 50, 60, 70, 80];
+const SHARE = [0, 0.10, 0.25, 0.45, 0.70];
+const SPAWN_TIME = 20;                          // seconds over which a horde spawns
+const BUDGET = 200, TOWER_MAX = 100;
+const WALL_LV = [{ cost: 0, hp: 0 }, { cost: 10, hp: 40 }, { cost: 20, hp: 80 }, { cost: 30, hp: 120 }];
+const TT = { // turret types: damage multipliers vs enemy types
+  basic: { name: 'Basic', cost: 15, col: '#e9ecef', vs: { ground: 1, flyer: 0, armored: 0.25 } },
+  aa:    { name: 'Anti-air', cost: 20, col: '#4dabf7', vs: { ground: 0.5, flyer: 1.5, armored: 0 } },
+  ap:    { name: 'Armor-piercing', cost: 25, col: '#ff922b', vs: { ground: 0.6, flyer: 0, armored: 1.5 } },
 };
-const SPELL_KEYS = ['fireball', 'freeze', 'mend'];
-const SLOTS = [];
-LANES.forEach((cx, lane) => {
-  [[-40, 490], [40, 490], [-40, 400], [40, 400]].forEach(([dx, y]) => SLOTS.push({ x: cx + dx, y, lane }));
-});
-const STORE_KEY = 'echoDefense_v1';
-
-// ================= PERSISTENCE =================
-function loadSave() {
-  try { const s = JSON.parse(localStorage.getItem(STORE_KEY)); if (s && s.day) return s; } catch (e) {}
-  return { day: 1, profile: null };
-}
-function writeSave() { try { localStorage.setItem(STORE_KEY, JSON.stringify(save)); } catch (e) {} }
-let save = loadSave();
-
-// ================= CANVAS =================
-const cv = document.getElementById('c');
-const ctx = cv.getContext('2d');
-let scale = 1;
-function resize() {
-  const vw = window.innerWidth, vh = window.innerHeight;
-  scale = Math.min(vw / W, vh / H);
-  const dpr = window.devicePixelRatio || 1;
-  cv.style.width = (W * scale) + 'px';
-  cv.style.height = (H * scale) + 'px';
-  cv.width = Math.round(W * scale * dpr);
-  cv.height = Math.round(H * scale * dpr);
-  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
-}
-window.addEventListener('resize', resize);
-resize();
+const TT_ORDER = ['basic', 'aa', 'ap'];
+const ET = { // enemy types
+  ground:  { hp: 3,  spd: 20, wallDps: 3, towerDmg: 2, col: '#69db7c', walls: true },
+  flyer:   { hp: 2.5, spd: 26, wallDps: 0, towerDmg: 2, col: '#66d9e8', walls: false },
+  armored: { hp: 8, spd: 13, wallDps: 5, towerDmg: 4, col: '#ffa94d', walls: true },
+};
+const COUNTER = { ground: ['basic', 'aa', 'ap'], flyer: ['aa'], armored: ['ap'] };
+const ARMY_RANGE = 30, ARMY_DPS = 2.5, ARMY_TRAVEL = 8;
 
 // ================= STATE =================
-let screen = 'title'; // title | play | end | card
-let G = null;         // current run
-let buttons = [];     // [{x,y,w,h,fn}] for menu screens
-let lastResult = null;
-
-const rand = (a, b) => a + Math.random() * (b - a);
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const laneOf = x => clamp(Math.floor(x / 120), 0, 2);
-const argmax = arr => arr.reduce((bi, v, i) => v > arr[bi] ? i : bi, 0);
-const argmin = arr => arr.reduce((bi, v, i) => v < arr[bi] ? i : bi, 0);
-
-function newRun() {
-  const profile = save.day > 1 ? save.profile : null;
-  G = {
-    day: save.day, profile, echoOn: !!profile,
-    time: 0, wave: 0, waveT: 0, phase: 'break', breakT: 2.5,
-    points: 40, towersBuilt: 0,
-    walls: [0, 1, 2].map(i => ({ hp: WALL_MAX, dmgSince: null, flash: 0 })),
-    towers: [], enemies: [], fx: [], tracers: [], queue: [],
-    spells: { fireball: 0, freeze: 0, mend: 0 }, armed: null,
-    keepCd: 0,
-    echo: { target: null, pending: null, cpIdx: 0, commits: [], banner: null },
-    commanderCast: false, msgs: [],
-    rec: { towers: [], repairs: [], spells: [], dmg: [0, 0, 0], unrepaired: [] },
-    over: false,
+let S;
+function newGame() {
+  S = {
+    phase: 'build', round: 0, budget: BUDGET, tower: TOWER_MAX,
+    walls: Array.from({ length: SIDES }, () => ({ lv: 0, hp: 0, max: 0 })),
+    slots: Array.from({ length: SIDES }, () => null),   // turret {type, lv, cd}
+    armies: [{ side: 0, delay: 0 }, { side: 4, delay: 0 }],
+    enemies: [], queue: [], spawnT: 0, spawnEvery: 0.5,
+    rumors: {},            // side -> {side, byType, kind, stale}
+    carried: [],           // survivors: [{type, know:[sides]}]
+    fx: [], shots: [],
+    mode: null, sel: null, patches: 0, moves: 0, log: [],
+    stats: { killed: 0, escaped: 0, breaches: 0, staleHits: 0 },
+    time: 0, towerCd: 0,
   };
-  screen = 'play';
+  S.msg = 'BUILD: tap a wall side to cycle its strength, tap a ring dot to cycle turret type. Tap an army (purple) then a side to move it.';
+  ui();
 }
 
-// ================= WAVES =================
-function buildWave(w) {
-  const n = 10 + w * 5, q = [];
-  const share = G.echoOn ? ECHO_SHARE[w] : 0;
-  for (let i = 0; i < n; i++) {
-    const t = 1 + i * (WAVE_DUR - 6) / n + rand(-0.3, 0.3);
-    let r = Math.random(), type = 'grunt';
-    if (w >= 1 && r < 0.3) type = 'runner';
-    else if (w >= 2 && r > 0.8) type = 'brute';
-    const echo = Math.random() < share;
-    if (echo && G.profile && G.profile.favTowerLane != null && Math.random() < 0.35) type = 'archer';
-    q.push({ t, type, echo });
-  }
-  // guarantee at least one echo from wave 3 on
-  if (G.echoOn && w >= 2 && !q.some(e => e.echo)) q[Math.floor(n / 2)].echo = true;
-  if (G.echoOn && w === WAVES - 1) q.push({ t: WAVE_DUR * 0.3, type: 'commander', echo: true });
-  q.sort((a, b) => a.t - b.t);
-  return q;
-}
-const TYPES = {
-  grunt:     { hp: 22,  speed: 30, dps: 6,  r: 9,  pts: 4,  color: '#d64b4b' },
-  runner:    { hp: 12,  speed: 56, dps: 3,  r: 7,  pts: 3,  color: '#e8a33b' },
-  brute:     { hp: 70,  speed: 17, dps: 12, r: 13, pts: 9,  color: '#9b3fc4' },
-  archer:    { hp: 18,  speed: 34, dps: 0,  r: 8,  pts: 6,  color: '#4bd6d6' },
-  commander: { hp: 380, speed: 11, dps: 20, r: 17, pts: 40, color: '#38f0ff' },
-};
-function spawn(e) {
-  const T = TYPES[e.type];
-  let lane;
-  if (e.echo) {
-    if (e.type === 'archer') lane = G.profile.favTowerLane;
-    else lane = G.echo.target != null ? G.echo.target : (G.echo.pending ? G.echo.pending.lane : weakestLane().lane);
-  } else lane = Math.floor(Math.random() * 3);
-  const hpMul = 1 + G.wave * 0.18;
-  G.enemies.push({
-    type: e.type, echo: e.echo, lane, x: LANES[lane] + rand(-12, 12), y: FIELD_TOP - 10,
-    hp: T.hp * hpMul, maxHp: T.hp * hpMul, speed: T.speed, dps: T.dps, r: T.r, pts: T.pts,
-    slowT: 0, atWall: false, fireT: 1, off: rand(-12, 12),
-  });
-  if (e.type === 'commander') msg('ECHO COMMANDER has arrived!', '#38f0ff');
+// ================= HELPERS =================
+const sideAng = s => s * SA;
+const sideOf = a => ((Math.round(a / SA) % SIDES) + SIDES) % SIDES;
+const norm = a => { a %= Math.PI * 2; if (a > Math.PI) a -= Math.PI * 2; if (a < -Math.PI) a += Math.PI * 2; return a; };
+const P = (r, a) => ({ x: C + r * Math.sin(a), y: C - r * Math.cos(a) });
+const epos = e => P(e.r, e.a);
+const dist = (p, q) => Math.hypot(p.x - q.x, p.y - q.y);
+const trueGaps = () => Object.values(S.rumors).filter(r => !r.stale).length;
+const staleGaps = () => Object.values(S.rumors).filter(r => r.stale).length;
+function pickType(round) {
+  const x = rnd(), fly = round === 0 ? 0.15 : 0.22, arm = round === 0 ? 0.12 : 0.22;
+  return x < fly ? 'flyer' : x < fly + arm ? 'armored' : 'ground';
 }
 
-// ================= ECHO BRAIN =================
-function towersInLane(i) { return G.towers.filter(t => t.lane === i && t.buildT <= 0 && t.hp > 0).length; }
-function weakestLane() {
-  const p = G.profile || {};
-  const minHp = Math.min(...G.walls.map(w => w.hp));
-  const cov = [0, 1, 2].map(towersInLane);
-  const minCov = Math.min(...cov);
-  const scores = [0, 1, 2].map(i => {
-    const parts = [];
-    const weak = (1 - G.walls[i].hp / WALL_MAX) * 60;
-    parts.push({ v: weak + (G.walls[i].hp === minHp && weak > 3 ? 8 : 0), why: 'lowest wall' });
-    parts.push({ v: Math.max(0, 3 - cov[i]) * 7 + (cov[i] === minCov ? 4 : 0), why: cov[i] === 0 ? 'no tower cover' : 'thin tower cover' });
-    if (p.slowRepairLane === i) parts.push({ v: 16, why: 'you repair it slowly' });
-    if (p.neglectedLane === i) parts.push({ v: 13, why: 'you neglect it' });
-    const total = parts.reduce((s, x) => s + x.v, 0) + rand(0, 3);
-    return { lane: i, total, parts: parts.sort((a, b) => b.v - a.v) };
-  });
-  const best = scores.reduce((a, b) => b.total > a.total ? b : a);
-  const reasons = best.parts.filter(x => x.v > 2).slice(0, 2).map(x => x.why);
-  if (!reasons.length) reasons.push('probing');
-  return { lane: best.lane, reason: reasons.join(' + ') };
+// ================= RUMORS =================
+function breach(e, s, kind) {
+  const r = S.rumors[s];
+  if (r && r.stale) S.stats.staleHits++;
+  if (!r || r.stale || r.byType !== e.type) S.rumors[s] = { side: s, byType: e.type, kind, stale: false };
+  S.stats.breaches++;
+  spread(e, s, 0);
 }
-function echoTick(dt) {
-  if (!G.echoOn || G.phase !== 'wave') return;
-  const E = G.echo;
-  if (E.cpIdx < CHECKPOINTS.length && G.waveT >= CHECKPOINTS[E.cpIdx] * WAVE_DUR) {
-    const wl = weakestLane();
-    E.pending = { lane: wl.lane, reason: wl.reason, t: TELEGRAPH };
-    E.cpIdx++;
-  }
-  if (E.pending) {
-    E.pending.t -= dt;
-    if (E.pending.t <= 0) {
-      E.target = E.pending.lane;
-      E.commits.push({ wave: G.wave + 1, lane: E.target, reason: E.pending.reason });
-      G.enemies.forEach(en => { if (en.echo && en.type !== 'archer' && !en.atWall) en.lane = E.target; });
-      E.pending = null;
-    }
+function spread(src, s, hop) {
+  src.know.add(s);
+  const p = epos(src);
+  S.fx.push({ x: p.x, y: p.y, t: 0 });
+  if (hop >= 2) return;
+  for (const o of S.enemies) {
+    if (o.dead || o.know.has(s)) continue;
+    if (dist(p, epos(o)) <= RUMOR_R) { o.know.add(s); if (o.r > WALL_R + 12) o.committed = false; spread(o, s, hop + 1); }
   }
 }
-function commanderCast(cmd) {
-  const spell = (G.profile && G.profile.favSpell) || 'fireball';
-  const lane = G.echo.target != null ? G.echo.target : cmd.lane;
-  if (spell === 'fireball') {
-    damageWall(lane, 18);
-    G.towers.forEach(t => { if (t.lane === lane) t.hp -= 30; });
-    G.fx.push({ type: 'boom', x: LANES[lane], y: WALL_Y - 20, r: 70, t: 0.6, color: '#38f0ff' });
-  } else if (spell === 'freeze') {
-    G.towers.forEach(t => { if (t.lane === lane) t.frozenT = 6; });
-    G.fx.push({ type: 'lane', lane, t: 1, color: '#38f0ff' });
-  } else {
-    G.enemies.forEach(e => { if (e.echo) e.hp = Math.min(e.maxHp, e.hp + e.maxHp * 0.5); });
-    G.fx.push({ type: 'boom', x: cmd.x, y: cmd.y, r: 90, t: 0.8, color: '#7dff8a' });
-  }
-  msg('Echo Commander casts YOUR ' + SPELLS[spell].name + '!', '#38f0ff');
+function makeStale(s, why) {
+  const r = S.rumors[s];
+  if (r && !r.stale) { r.stale = true; S.log.push(`${SIDE_NAMES[s]} rumor is now STALE (${why})`); return true; }
+  return false;
 }
+function counters(turret, type) { return turret && COUNTER[type].includes(turret.type); }
 
-// ================= ACTIONS =================
-function msg(text, color) { G.msgs.push({ text, color: color || '#fff', t: 2.5 }); if (G.msgs.length > 3) G.msgs.shift(); }
-function towerCost() { return TOWER_BASE + TOWER_STEP * G.towersBuilt; }
-function damageWall(i, d) {
-  const w = G.walls[i];
-  if (w.hp <= 0) return;
-  w.hp -= d; w.flash = 0.15; G.rec.dmg[i] += d;
-  if (w.dmgSince == null) w.dmgSince = G.time;
-  if (w.hp <= 0) { w.hp = 0; endRun(false, LN[i] + ' wall broke'); }
-}
-function repairWall(i) {
-  const w = G.walls[i];
-  if (w.hp >= WALL_MAX) { msg('Wall already full'); return; }
-  if (G.points < REPAIR_COST) { msg('Need ' + REPAIR_COST + ' pts to repair', '#f88'); return; }
-  G.points -= REPAIR_COST;
-  w.hp = Math.min(WALL_MAX, w.hp + REPAIR_AMT);
-  const delay = w.dmgSince != null ? G.time - w.dmgSince : 0;
-  G.rec.repairs.push({ lane: i, delay: +delay.toFixed(1), wave: G.wave + 1, t: +G.time.toFixed(1) });
-  w.dmgSince = w.hp >= WALL_MAX ? null : G.time;
-  G.fx.push({ type: 'text', x: LANES[i], y: WALL_Y - 14, text: '+' + REPAIR_AMT, t: 0.8, color: '#7dff8a' });
-}
-function buildTower(slotIdx) {
-  const s = SLOTS[slotIdx], cost = towerCost();
-  if (G.points < cost) { msg('Tower costs ' + cost + ' pts', '#f88'); return; }
-  G.points -= cost; G.towersBuilt++;
-  G.towers.push({ slot: slotIdx, lane: s.lane, x: s.x, y: s.y, buildT: BUILD_TIME, hp: 60, maxHp: 60, cd: 0, frozenT: 0 });
-  G.rec.towers.push({ lane: s.lane, wave: G.wave + 1, t: +G.time.toFixed(1), phase: G.phase === 'wave' ? +clamp(G.waveT / WAVE_DUR, 0, 1).toFixed(2) : 0 });
-}
-function recordSpell(key) {
-  G.rec.spells.push({ spell: key, wave: G.wave + 1, phase: G.phase === 'wave' ? +clamp(G.waveT / WAVE_DUR, 0, 1).toFixed(2) : 0 });
-  G.spells[key] = SPELLS[key].cd; G.armed = null;
-}
-function castFireball(x, y) {
-  G.enemies.forEach(e => { if (Math.hypot(e.x - x, e.y - y) < 55 + e.r) e.hp -= 45; });
-  G.fx.push({ type: 'boom', x, y, r: 55, t: 0.5, color: '#ff7a2f' });
-  recordSpell('fireball');
-}
-function castFreeze(lane) {
-  G.enemies.forEach(e => { if (e.lane === lane || laneOf(e.x) === lane) e.slowT = 5; });
-  G.fx.push({ type: 'lane', lane, t: 1, color: '#6fc8ff' });
-  recordSpell('freeze');
-}
-function castMend() {
-  G.walls.forEach((w, i) => { if (w.hp > 0) { w.hp = Math.min(WALL_MAX, w.hp + 15); if (w.hp >= WALL_MAX) w.dmgSince = null; } });
-  G.fx.push({ type: 'mend', t: 0.8 });
-  recordSpell('mend');
-}
-
-// ================= RECORDING -> PROFILE =================
-function finalizeRecording() {
-  G.walls.forEach((w, i) => { if (w.dmgSince != null && w.hp < WALL_MAX) G.rec.unrepaired.push({ lane: i, delay: +(G.time - w.dmgSince).toFixed(1) }); });
-}
-function buildProfile(rec) {
-  const avgDelay = [0, 1, 2].map(i => {
-    const ds = rec.repairs.filter(r => r.lane === i).map(r => r.delay)
-      .concat(rec.unrepaired.filter(r => r.lane === i).map(r => r.delay));
-    if (!ds.length) return rec.dmg[i] > 5 ? 30 : 0;
-    return ds.reduce((a, b) => a + b, 0) / ds.length;
-  });
-  const damaged = [0, 1, 2].filter(i => rec.dmg[i] > 5);
-  const slowRepairLane = damaged.length ? damaged.reduce((a, b) => avgDelay[b] > avgDelay[a] ? b : a) : null;
-  const towerCounts = [0, 1, 2].map(i => rec.towers.filter(t => t.lane === i).length);
-  const favTowerLane = rec.towers.length ? argmax(towerCounts) : null;
-  const repairCounts = [0, 1, 2].map(i => rec.repairs.filter(r => r.lane === i).length);
-  const attention = [0, 1, 2].map(i => towerCounts[i] * 2 + repairCounts[i] - rec.dmg[i] / 60);
-  const neglectedLane = argmin(attention);
-  const spellCounts = {}; rec.spells.forEach(s => spellCounts[s.spell] = (spellCounts[s.spell] || 0) + 1);
-  const favSpell = rec.spells.length ? Object.keys(spellCounts).reduce((a, b) => spellCounts[b] > spellCounts[a] ? b : a) : null;
-  const favPhases = favSpell ? rec.spells.filter(s => s.spell === favSpell).map(s => s.phase) : [];
-  const favSpellPhase = favPhases.length ? favPhases.reduce((a, b) => a + b, 0) / favPhases.length : 0.5;
-  const nm = s => s[0] + s.slice(1).toLowerCase();
-  const habits = [];
-  if (slowRepairLane != null) habits.push({ label: 'Slow ' + nm(LN[slowRepairLane]) + ' Repair', s: avgDelay[slowRepairLane] / 8,
-    detail: LN[slowRepairLane] + ' wall: avg ' + avgDelay[slowRepairLane].toFixed(1) + 's before repair' });
-  if (favTowerLane != null) {
-    const share = towerCounts[favTowerLane] / rec.towers.length;
-    habits.push({ label: nm(LN[favTowerLane]) + ' Stacker', s: (towerCounts[favTowerLane] >= 2 ? share * 2.2 : 0.4),
-      detail: towerCounts[favTowerLane] + ' of ' + rec.towers.length + ' towers in ' + LN[favTowerLane] });
+// ================= ROUNDS =================
+function startRound() {
+  const n = HORDE[S.round];
+  // stale rumors lose about half their believers each round
+  for (const c of S.carried) c.know = c.know.filter(s => S.rumors[s] && (!S.rumors[s].stale || rnd() < 0.5));
+  // rumors live only in creatures who know them
+  const alive = pruneRumors();
+  const list = [];
+  const carried = S.carried.slice(0, n);
+  carried.forEach(c => list.push({ type: c.type, know: c.know.slice(), vet: true }));
+  const knowers = carried.filter(c => c.know.length);
+  const target = alive.size ? Math.round(SHARE[S.round] * n) : 0;
+  let need = Math.max(0, target - knowers.length);
+  while (list.length < n) {
+    const k = need > 0 && knowers.length ? knowers[(rnd() * knowers.length) | 0].know.slice() : [];
+    if (k.length) need--;
+    list.push({ type: pickType(S.round), know: k, vet: false });
   }
-  if (favSpell) {
-    const when = favSpellPhase > 0.6 ? 'Late' : favSpellPhase < 0.3 ? 'Early' : 'Mid-wave';
-    habits.push({ label: SPELLS[favSpell].name + ' ' + when, s: Math.abs(favSpellPhase - 0.5) * 3 + spellCounts[favSpell] * 0.08,
-      detail: SPELLS[favSpell].name + ' x' + spellCounts[favSpell] + ', avg at ' + Math.round(favSpellPhase * 100) + '% of wave' });
-  }
-  habits.push({ label: nm(LN[neglectedLane]) + ' Neglecter', s: 0.9,
-    detail: LN[neglectedLane] + ' got the least towers/repairs' });
-  habits.sort((a, b) => b.s - a.s);
-  return {
-    signature: habits[0].label, habits, avgDelay: avgDelay.map(v => +v.toFixed(1)),
-    slowRepairLane, neglectedLane, favTowerLane, towerCounts, repairCounts,
-    favSpell, favSpellPhase: +favSpellPhase.toFixed(2), spellCounts, fromDay: save.day,
-  };
+  for (let i = list.length - 1; i > 0; i--) { const j = (rnd() * (i + 1)) | 0; [list[i], list[j]] = [list[j], list[i]]; }
+  S.queue = list; S.spawnEvery = SPAWN_TIME / n; S.spawnT = 0;
+  S.carried = []; S.enemies = []; S.phase = 'round'; S.mode = null; S.sel = null;
+  S.startKnowers = list.filter(x => x.know.length).length;
+  S.msg = `Round ${S.round + 1}: ${n} creatures, ${S.startKnowers} already know a weak spot.`;
+  ui();
 }
-function endRun(win, reason) {
-  if (G.over) return;
-  G.over = true;
-  finalizeRecording();
-  const profile = buildProfile(G.rec);
-  const commitsByLane = [0, 1, 2].map(i => G.echo.commits.filter(c => c.lane === i));
-  const recap = [];
-  if (!G.echoOn) recap.push('Day ' + G.day + ': no Echo yet. This run is', 'the first recording.');
-  else if (!G.echo.commits.length) recap.push('The Echo never committed to a lane.');
-  else {
-    const top = argmax(commitsByLane.map(c => c.length));
-    const rs = {}; commitsByLane[top].forEach(c => c.reason.split(' + ').forEach(r => rs[r] = (rs[r] || 0) + 1));
-    const why = Object.keys(rs).sort((a, b) => rs[b] - rs[a]).slice(0, 2).join(' + ');
-    recap.push('Echo hit ' + LN[top] + ' ' + commitsByLane[top].length + 'x of ' + G.echo.commits.length + ' commits,');
-    recap.push('because: ' + why + '.');
-    if (G.commanderCast) recap.push('Commander used your ' + SPELLS[(G.profile.favSpell || 'fireball')].name + '.');
-  }
-  lastResult = { win, reason, recap, profile, rec: G.rec, day: G.day, wave: G.wave + 1, points: G.points };
-  screen = 'end';
+function spawn(d) {
+  const t = ET[d.type];
+  S.enemies.push({ type: d.type, hp: t.hp * (1 + 0.08 * S.round), max: t.hp * (1 + 0.08 * S.round), r: SPAWN_R, a: rnd() * Math.PI * 2,
+    know: new Set(d.know), target: -1, committed: d.know.length === 0, vet: d.vet, dead: false });
 }
-function nextDay() {
-  save.profile = lastResult.profile;
-  save.day = lastResult.day + 1;
-  writeSave();
-  screen = 'card';
+function pruneRumors() { // rumors live only in creatures who know them: kill the messenger and the rumor dies
+  const alive = new Set(); S.carried.forEach(c => c.know.forEach(s => alive.add(s)));
+  for (const k of Object.keys(S.rumors)) if (!alive.has(+k)) delete S.rumors[k];
+  return alive;
 }
-function resetAll() {
-  try { localStorage.removeItem(STORE_KEY); } catch (e) {}
-  save = { day: 1, profile: null }; lastResult = null; G = null; screen = 'title';
+function endRound() {
+  S.round++;
+  pruneRumors();
+  if (S.round >= ROUNDS) { S.phase = 'won'; S.msg = `YOU WIN! The tower held all 5 rounds with ${Math.ceil(S.tower)} HP left.`; ui(); return; }
+  S.phase = 'between'; S.patches = 3; S.moves = 2; S.mode = null; S.sel = null; S.log = [];
+  S.msg = `Round ${S.round} survived. ${S.carried.length} creatures escaped and carry what they learned. Use 3 patches and 2 turret moves.`;
+  ui();
 }
 
 // ================= UPDATE =================
 function update(dt) {
-  if (screen !== 'play' || G.over) return;
-  G.time += dt;
-  for (const k of SPELL_KEYS) G.spells[k] = Math.max(0, G.spells[k] - dt);
-  G.walls.forEach(w => w.flash = Math.max(0, w.flash - dt));
+  S.time += dt;
+  for (const f of S.fx) f.t += dt; S.fx = S.fx.filter(f => f.t < 0.6);
+  for (const s of S.shots) s.t += dt; S.shots = S.shots.filter(s => s.t < 0.12);
+  if (S.phase !== 'round') return;
+  S.spawnT -= dt;
+  while (S.queue.length && S.spawnT <= 0) { spawn(S.queue.shift()); S.spawnT += S.spawnEvery; }
+  for (const a of S.armies) if (a.delay > 0) a.delay -= dt;
 
-  if (G.phase === 'break') {
-    G.breakT -= dt;
-    if (G.breakT <= 0) {
-      G.phase = 'wave'; G.waveT = 0; G.queue = buildWave(G.wave);
-      G.echo.cpIdx = 0; G.echo.pending = null;
-      msg('Wave ' + (G.wave + 1) + ' begins', '#ffd34d');
+  for (const e of S.enemies) {
+    if (e.dead) continue;
+    const t = ET[e.type], v = t.spd * dt;
+    if (!e.committed && e.target < 0 && e.know.size) {
+      let best = -1, bd = 9;
+      for (const s of e.know) { const d = Math.abs(norm(sideAng(s) - e.a)); if (d < bd) { bd = d; best = s; } }
+      e.target = best;
     }
-  } else {
-    G.waveT += dt;
-    while (G.queue.length && G.queue[0].t <= G.waveT) spawn(G.queue.shift());
-    echoTick(dt);
-    if (G.waveT >= WAVE_DUR * 0.4 && !G.queue.length && !G.enemies.length) {
-      G.wave++;
-      if (G.wave >= WAVES) { endRun(true, 'All ' + WAVES + ' waves cleared'); return; }
-      G.phase = 'break'; G.breakT = BREAK_DUR; G.echo.target = null; G.echo.pending = null;
-      G.points += 10; msg('Wave cleared! +10 pts', '#7dff8a');
+    if (!e.committed && e.target >= 0) {
+      const d = norm(sideAng(e.target) - e.a);
+      if (Math.abs(d) < 0.03) { e.committed = true; e.a = sideAng(e.target) + (rnd() - 0.5) * 0.5; }
+      else if (e.r > ORBIT_R) e.r = Math.max(ORBIT_R, e.r - v);
+      else e.a += Math.sign(d) * Math.min(Math.abs(d), v / e.r);
+      continue;
     }
+    let nr = e.r - v;
+    const s = sideOf(e.a), w = S.walls[s];
+    if (t.walls && w.hp > 0 && e.r >= WALL_R + 4 && nr < WALL_R + 4) {
+      nr = WALL_R + 4; w.hp -= t.wallDps * dt;
+      if (w.hp <= 0) { w.hp = 0; breach(e, s, 'wall'); }
+    }
+    if (e.r >= INNER_R && nr < INNER_R) breach(e, s, 'slip');
+    e.r = nr;
+    if (e.r <= TOWER_R) { S.tower -= t.towerDmg; e.dead = true; S.stats.escaped++; S.carried.push({ type: e.type, know: [...e.know] }); }
   }
-
-  // enemies
-  for (const e of G.enemies) {
-    const sp = e.speed * (e.slowT > 0 ? 0.4 : 1);
-    e.slowT = Math.max(0, e.slowT - dt);
-    const tx = LANES[e.lane] + e.off;
-    e.x += clamp(tx - e.x, -60 * dt, 60 * dt);
-    if (e.type === 'archer') {
-      if (e.y < 300) e.y += sp * dt;
-      else {
-        e.fireT -= dt;
-        if (e.fireT <= 0) {
-          e.fireT = 1.6;
-          const tw = G.towers.filter(t => t.hp > 0 && Math.abs(t.x - e.x) < 140).sort((a, b) => Math.hypot(a.x - e.x, a.y - e.y) - Math.hypot(b.x - e.x, b.y - e.y))[0];
-          if (tw) { tw.hp -= 7; G.tracers.push({ x1: e.x, y1: e.y, x2: tw.x, y2: tw.y, t: 0.15, c: '#38f0ff' }); }
-          else { damageWall(e.lane, 5); G.tracers.push({ x1: e.x, y1: e.y, x2: e.x, y2: WALL_Y, t: 0.15, c: '#38f0ff' }); }
-        }
-      }
-    } else if (e.y < STOP_Y - e.r) {
-      e.y += sp * dt; e.atWall = false;
-    } else {
-      e.atWall = true;
-      damageWall(laneOf(e.x), e.dps * dt * (e.slowT > 0 ? 0.5 : 1));
-      if (G.over) return;
+  // turrets
+  S.slots.forEach((tu, i) => {
+    if (!tu) return;
+    tu.cd -= dt; if (tu.cd > 0) return;
+    const sp = P(SLOT_R, sideAng(i)), range = 95 + 12 * (tu.lv - 1);
+    let best = null, bs = -1e9;
+    for (const e of S.enemies) {
+      if (e.dead || TT[tu.type].vs[e.type] === 0) continue;
+      const d = dist(sp, epos(e)); if (d > range) continue;
+      const score = (e.know.size ? 1000 : 0) - e.r; // kill the messenger first
+      if (score > bs) { bs = score; best = e; }
     }
-    if (e.type === 'commander' && !G.commanderCast && G.waveT / WAVE_DUR >= Math.max(0.4, G.profile.favSpellPhase || 0.5)) {
-      G.commanderCast = true; commanderCast(e);
-    }
-  }
-  // towers
-  G.towers = G.towers.filter(t => { if (t.hp <= 0) { msg(LN[t.lane] + ' tower destroyed', '#f88'); return false; } return true; });
-  for (const t of G.towers) {
-    if (t.buildT > 0) { t.buildT -= dt; continue; }
-    if (t.frozenT > 0) { t.frozenT -= dt; continue; }
-    t.cd -= dt;
-    if (t.cd <= 0) {
-      let best = null, bd = 1e9;
-      for (const e of G.enemies) {
-        const d = Math.hypot(e.x - t.x, e.y - t.y);
-        const score = d + (laneOf(e.x) === t.lane ? 0 : 60);
-        if (d < 165 && score < bd) { bd = score; best = e; }
-      }
-      if (best) { best.hp -= 8; t.cd = 0.85; G.tracers.push({ x1: t.x, y1: t.y, x2: best.x, y2: best.y, t: 0.1, c: '#ffe08a' }); }
-    }
-  }
-  // keep's weak auto-bolt
-  G.keepCd -= dt;
-  if (G.keepCd <= 0) {
-    const tgt = G.enemies.filter(e => e.y > 260).sort((a, b) => b.y - a.y)[0];
-    if (tgt) { tgt.hp -= 5; G.keepCd = 1.3; G.tracers.push({ x1: 180, y1: 600, x2: tgt.x, y2: tgt.y, t: 0.1, c: '#fff' }); }
-  }
-  // deaths
-  G.enemies = G.enemies.filter(e => {
-    if (e.hp > 0) return true;
-    G.points += e.pts;
-    G.fx.push({ type: 'text', x: e.x, y: e.y, text: '+' + e.pts, t: 0.7, color: e.echo ? '#38f0ff' : '#ffd34d' });
-    if (e.type === 'commander') msg('Echo Commander defeated!', '#38f0ff');
-    return false;
+    if (!best) return;
+    tu.cd = 0.7;
+    best.hp -= 2 * (1 + 0.5 * (tu.lv - 1)) * TT[tu.type].vs[best.type];
+    const ep = epos(best); S.shots.push({ x1: sp.x, y1: sp.y, x2: ep.x, y2: ep.y, col: TT[tu.type].col, t: 0 });
   });
-  G.fx = G.fx.filter(f => (f.t -= dt) > 0);
-  G.tracers = G.tracers.filter(f => (f.t -= dt) > 0);
-  G.msgs = G.msgs.filter(m => (m.t -= dt) > 0);
+  // armies: area damage to ground units
+  for (const a of S.armies) {
+    if (a.delay > 0) continue;
+    const ap = P(ARMY_R, sideAng(a.side));
+    for (const e of S.enemies) if (!e.dead && e.type !== 'flyer' && dist(ap, epos(e)) <= ARMY_RANGE) e.hp -= ARMY_DPS * dt * (e.type === 'armored' ? 0.5 : 1);
+  }
+  // the tower itself has a weak gun that hits anything close
+  S.towerCd -= dt;
+  if (S.towerCd <= 0) {
+    let best = null; for (const e of S.enemies) if (!e.dead && e.r < 75 && (!best || e.r < best.r)) best = e;
+    if (best) { S.towerCd = 0.5; best.hp -= 1; const ep = epos(best); S.shots.push({ x1: C, y1: C, x2: ep.x, y2: ep.y, col: '#ffffff', t: 0 }); }
+  }
+  for (const e of S.enemies) if (!e.dead && e.hp <= 0) { e.dead = true; S.stats.killed++; }
+  S.enemies = S.enemies.filter(e => !e.dead);
+  if (S.tower <= 0) { S.tower = 0; S.phase = 'lost'; S.msg = `The tower fell in round ${S.round + 1}. The horde knew ${trueGaps()} side gaps. Tap Restart to try a new build.`; ui(); return; }
+  if (!S.queue.length && !S.enemies.length) endRound();
 }
 
 // ================= INPUT =================
-function spellBtnRect(i) { return { x: 8 + i * 116, y: 648, w: 112, h: 60 }; }
-function onTap(x, y) {
-  if (screen !== 'play') {
-    for (const b of buttons) if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { b.fn(); return; }
-    return;
-  }
-  if (G.over) return;
-  // spell buttons
-  for (let i = 0; i < 3; i++) {
-    const r = spellBtnRect(i), k = SPELL_KEYS[i];
-    if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
-      if (G.spells[k] > 0) { msg(SPELLS[k].name + ' on cooldown'); return; }
-      if (k === 'mend') castMend();
-      else G.armed = G.armed === k ? null : k;
-      return;
-    }
-  }
-  if (G.armed && y > FIELD_TOP && y < WALL_Y + WALL_H) {
-    if (G.armed === 'fireball') castFireball(x, y); else castFreeze(laneOf(x));
-    return;
-  }
-  // tower slots
-  for (let i = 0; i < SLOTS.length; i++) {
-    const s = SLOTS[i];
-    if (Math.abs(x - s.x) < 20 && Math.abs(y - s.y) < 20) {
-      if (G.towers.some(t => t.slot === i)) msg('Slot taken'); else buildTower(i);
-      return;
-    }
-  }
-  // walls (generous hit area)
-  if (y > WALL_Y - 26 && y < WALL_Y + WALL_H + 30) { repairWall(laneOf(x)); return; }
-  if (G.armed) G.armed = null;
+function hit(x, y) {
+  const dx = x - C, dy = y - C, r = Math.hypot(dx, dy), a = Math.atan2(dx, -dy);
+  for (let i = 0; i < SIDES; i++) if (dist({ x, y }, P(SLOT_R, sideAng(i))) < 20) return { kind: 'slot', i };
+  for (let i = 0; i < S.armies.length; i++) if (dist({ x, y }, P(ARMY_R, sideAng(S.armies[i].side))) < 20) return { kind: 'army', i };
+  if (r < TOWER_R + 8) return { kind: 'tower' };
+  if (r > WALL_R - 20 && r < WALL_R + 22) return { kind: 'wall', i: sideOf(a) };
+  if (r > ARMY_R - 35) return { kind: 'side', i: sideOf(a) };
+  return null;
 }
+function tap(x, y) {
+  const h = hit(x, y); if (!h) return;
+  const ph = S.phase;
+  if (ph !== 'build' && ph !== 'between') return;
+  // armies: select then tap a side
+  if (S.sel && S.sel.kind === 'army' && (h.kind === 'side' || h.kind === 'slot' || h.kind === 'wall')) {
+    const a = S.armies[S.sel.i], s = h.i;
+    if (S.armies.some(o => o !== a && o.side === s)) { S.msg = 'Another army is already there.'; ui(); return; }
+    if (a.side !== s) {
+      a.side = s;
+      if (ph === 'between') { a.delay = ARMY_TRAVEL; if (makeStale(s, 'army moved in')) S.msg = `Army moved to ${SIDE_NAMES[s]}: that rumor is stale. It arrives ${ARMY_TRAVEL}s into the next round.`; else S.msg = `Army will arrive at ${SIDE_NAMES[s]} ${ARMY_TRAVEL}s into the next round.`; }
+    }
+    S.sel = null; ui(); return;
+  }
+  if (h.kind === 'army') { S.sel = { kind: 'army', i: h.i }; S.msg = 'Army selected: tap a side (outer ring) to move it there.'; ui(); return; }
+  if (ph === 'build') return buildTap(h);
+  return betweenTap(h);
+}
+function buildTap(h) {
+  if (h.kind === 'wall') {
+    const w = S.walls[h.i], next = (w.lv + 1) % 4, delta = WALL_LV[next].cost - WALL_LV[w.lv].cost;
+    if (delta > S.budget) { const back = WALL_LV[w.lv].cost; S.budget += back; w.lv = 0; w.hp = w.max = 0; S.msg = 'Not enough budget: wall removed (refunded).'; }
+    else { S.budget -= delta; w.lv = next; w.hp = w.max = WALL_LV[next].hp; S.msg = `${SIDE_NAMES[h.i]} wall: level ${next} (${w.max} HP).`; }
+  } else if (h.kind === 'slot') {
+    const cur = S.slots[h.i], idx = cur ? TT_ORDER.indexOf(cur.type) : -1;
+    if (cur) S.budget += TT[cur.type].cost;
+    S.slots[h.i] = null;
+    let nidx = idx + 1;
+    while (nidx < TT_ORDER.length && TT[TT_ORDER[nidx]].cost > S.budget) nidx++;
+    if (nidx < TT_ORDER.length) { const ty = TT_ORDER[nidx]; S.budget -= TT[ty].cost; S.slots[h.i] = { type: ty, lv: 1, cd: 0 }; S.msg = `${SIDE_NAMES[h.i]} turret: ${TT[ty].name}.`; }
+    else S.msg = `${SIDE_NAMES[h.i]} turret slot emptied.`;
+  }
+  ui();
+}
+function betweenTap(h) {
+  const m = S.mode;
+  if (!m) { S.msg = 'Pick an action below first (patch or move), then tap the target.'; ui(); return; }
+  if (m === 'moveT') {
+    if (!S.sel && h.kind === 'slot' && S.slots[h.i]) { S.sel = { kind: 'slot', i: h.i }; S.msg = 'Now tap an empty ring dot to move it there.'; ui(); return; }
+    if (S.sel && h.kind === 'slot') {
+      if (S.slots[h.i]) { S.msg = 'That spot is taken: pick an empty dot.'; ui(); return; }
+      if (S.moves <= 0) return;
+      S.slots[h.i] = S.slots[S.sel.i]; S.slots[S.sel.i] = null; S.moves--;
+      S.msg = `Turret moved ${SIDE_NAMES[S.sel.i]} -> ${SIDE_NAMES[h.i]}.` + (makeStale(h.i, 'turret moved in') ? ' That gap rumor is now STALE: believers will walk into it.' : '') + ` ${SIDE_NAMES[S.sel.i]} is now open.`;
+      S.sel = null; if (!S.moves) S.mode = null; ui(); return;
+    }
+    return;
+  }
+  if (S.patches <= 0) return;
+  const r = S.rumors[h.i];
+  if ((m === 'repair' || m === 'reinforce') && h.kind === 'wall') {
+    const w = S.walls[h.i];
+    if (m === 'repair') { if (!w.max) { S.msg = 'No wall was built there (walls are fixed at build).'; ui(); return; } w.hp = w.max; }
+    else { if (!w.max) { S.msg = 'No wall was built there (walls are fixed at build).'; ui(); return; } w.max += 30; w.hp = w.max; }
+    S.patches--; S.msg = `${SIDE_NAMES[h.i]} wall ${m === 'repair' ? 'repaired' : 'reinforced'} (${w.hp} HP).`;
+    if (r && r.kind === 'wall' && r.byType !== 'flyer' && makeStale(h.i, 'wall patched')) S.msg += ' Rumor STALE.';
+  } else if ((m === 'upgrade' || m === 'switch') && h.kind === 'slot' && S.slots[h.i]) {
+    const tu = S.slots[h.i];
+    if (m === 'upgrade') tu.lv++; else tu.type = TT_ORDER[(TT_ORDER.indexOf(tu.type) + 1) % 3];
+    S.patches--; S.msg = `${SIDE_NAMES[h.i]} turret: ${TT[tu.type].name} L${tu.lv}.`;
+    if (r && counters(tu, r.byType) && makeStale(h.i, 'turret now counters ' + r.byType)) S.msg += ' Rumor STALE.';
+  } else { S.msg = 'That target does not fit the chosen action.'; ui(); return; }
+  if (!S.patches) S.mode = null;
+  ui();
+}
+function repairTower() {
+  if (S.phase !== 'between' || S.patches <= 0 || S.tower >= TOWER_MAX) return;
+  S.tower = Math.min(TOWER_MAX, S.tower + 30); S.patches--; S.msg = `Tower repaired to ${Math.ceil(S.tower)} HP.`; if (!S.patches && S.mode !== 'moveT') S.mode = null; ui();
+}
+
+// ================= UI =================
+const $ = id => document.getElementById(id);
+function btn(label, fn, cls, dis) { const b = document.createElement('button'); b.textContent = label; b.onclick = fn; if (cls) b.className = cls; if (dis) b.disabled = true; return b; }
+function ui() {
+  const ph = S.phase;
+  const roundTxt = ph === 'build' ? 'Build' : ph === 'between' ? `After R${S.round}/5` : ph === 'round' ? `Round ${S.round + 1}/5` : ph === 'won' ? 'Won' : 'Lost';
+  $('hud').textContent = `${roundTxt} · Tower ${Math.ceil(S.tower)}/${TOWER_MAX}` + (ph === 'build' ? ` · Budget ${S.budget}` : ph === 'between' ? ` · Patches ${S.patches} · Moves ${S.moves}` : '');
+  $('msg').textContent = S.msg + (S.log.length && ph === 'between' ? '' : '');
+  const T = $('tools'); T.innerHTML = '';
+  if (ph === 'build') {
+    T.append(btn(`Start round 1 ▶`, () => startRound(), 'go'));
+    T.append(btn('Quick build', () => { autoBuild(); }));
+  } else if (ph === 'between') {
+    const mk = (k, label) => T.append(btn(label, () => { S.mode = S.mode === k ? null : k; S.sel = null; S.msg = { repair: 'Tap a wall to repair it to full.', reinforce: 'Tap a wall to add +30 max HP.', upgrade: 'Tap a turret to upgrade it.', switch: 'Tap a turret to switch its counter type.', moveT: 'Tap a turret, then an empty dot.' }[k] || ''; ui(); }, S.mode === k ? 'on' : '', k === 'moveT' ? S.moves <= 0 : S.patches <= 0));
+    mk('repair', 'Repair wall'); mk('reinforce', 'Reinforce wall');
+    T.append(btn('Repair tower +30', repairTower, '', S.patches <= 0 || S.tower >= TOWER_MAX));
+    mk('upgrade', 'Upgrade turret'); mk('switch', 'Switch type'); mk('moveT', 'Move turret');
+    T.append(btn(`Start round ${S.round + 1} ▶`, () => startRound(), 'go'));
+  }
+  readout();
+}
+function readout() {
+  const marked = S.phase === 'round' ? S.enemies.filter(e => e.know.size).length : S.carried.filter(c => c.know.length).length;
+  const gaps = Object.values(S.rumors).map(r => `${SIDE_NAMES[r.side]}${r.stale ? '(stale)' : ''}`).join(' ');
+  $('readout').textContent = `Horde knows: ${trueGaps()} side gap${trueGaps() === 1 ? '' : 's'}` + (staleGaps() ? ` (+${staleGaps()} stale)` : '') +
+    ` · ${marked} marked ${S.phase === 'round' ? 'on field' : 'survivors'}` + (gaps ? ` · ${gaps}` : '');
+}
+
+// ================= RENDER =================
+const cv = $('c'), ctx = cv.getContext('2d');
+let scale = 1;
+function resize() {
+  const w = Math.min(window.innerWidth - 12, 548), hAvail = window.innerHeight - 230;
+  const size = Math.max(260, Math.min(w, hAvail > 300 ? hAvail : w));
+  const dpr = window.devicePixelRatio || 1;
+  cv.style.width = size + 'px'; cv.style.height = size + 'px';
+  cv.width = size * dpr; cv.height = size * dpr; scale = size / WORLD * dpr;
+}
+window.addEventListener('resize', resize);
 cv.addEventListener('pointerdown', ev => {
   ev.preventDefault();
   const r = cv.getBoundingClientRect();
-  onTap((ev.clientX - r.left) / scale, (ev.clientY - r.top) / scale);
-}, { passive: false });
-document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+  tap((ev.clientX - r.left) / r.width * WORLD, (ev.clientY - r.top) / r.height * WORLD);
+});
 
-// ================= DRAW =================
-function txt(s, x, y, size, color, align, bold) {
-  ctx.fillStyle = color || '#fff';
-  ctx.font = (bold ? 'bold ' : '') + (size || 14) + 'px -apple-system,Helvetica,Arial,sans-serif';
-  ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle';
-  ctx.fillText(s, x, y);
-}
-function rrect(x, y, w, h, r, fill, stroke) {
-  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
-  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
-  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); }
-}
-function button(label, x, y, w, h, fn, color) {
-  rrect(x, y, w, h, 10, color || '#2f6df6');
-  txt(label, x + w / 2, y + h / 2, 17, '#fff', 'center', true);
-  buttons.push({ x, y, w, h, fn });
-}
-function wrapLines(s, maxW, size) {
-  ctx.font = size + 'px -apple-system,Helvetica,Arial,sans-serif';
-  const words = s.split(' '), lines = []; let cur = '';
-  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (ctx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
-  if (cur) lines.push(cur); return lines;
-}
-
-function drawPlay() {
-  const now = performance.now() / 1000;
-  // lanes
-  for (let i = 0; i < 3; i++) {
-    ctx.fillStyle = i % 2 ? '#1b222c' : '#182029';
-    ctx.fillRect(i * 120, FIELD_TOP, 120, WALL_Y - FIELD_TOP);
-    ctx.fillStyle = '#232c38'; ctx.fillRect(LANES[i] - 22, FIELD_TOP, 44, WALL_Y - FIELD_TOP);
-  }
-  // echo telegraph / target
-  const E = G.echo;
-  if (E.pending) {
-    const a = 0.18 + 0.15 * Math.sin(now * 12);
-    ctx.fillStyle = 'rgba(56,240,255,' + a + ')'; ctx.fillRect(E.pending.lane * 120, FIELD_TOP, 120, WALL_Y - FIELD_TOP);
-  }
-  if (E.target != null && G.phase === 'wave') {
-    ctx.strokeStyle = 'rgba(56,240,255,0.7)'; ctx.lineWidth = 3; ctx.setLineDash([8, 6]);
-    ctx.strokeRect(E.target * 120 + 3, FIELD_TOP + 3, 114, WALL_Y - FIELD_TOP - 6); ctx.setLineDash([]);
-  }
-  // lane fx
-  for (const f of G.fx) if (f.type === 'lane') { ctx.fillStyle = f.color; ctx.globalAlpha = f.t * 0.35; ctx.fillRect(f.lane * 120, FIELD_TOP, 120, WALL_Y - FIELD_TOP); ctx.globalAlpha = 1; }
-  // slots
-  SLOTS.forEach((s, i) => {
-    if (!G.towers.some(t => t.slot === i)) {
-      ctx.strokeStyle = G.points >= towerCost() ? '#5a6b80' : '#3a4350'; ctx.lineWidth = 2; ctx.setLineDash([4, 4]);
-      ctx.strokeRect(s.x - 15, s.y - 15, 30, 30); ctx.setLineDash([]);
-      txt('+', s.x, s.y + 1, 16, '#5a6b80', 'center');
-    }
-  });
-  // towers
-  for (const t of G.towers) {
-    if (t.buildT > 0) {
-      ctx.strokeStyle = '#c9a25a'; ctx.lineWidth = 2;
-      for (let k = -12; k <= 12; k += 8) { ctx.beginPath(); ctx.moveTo(t.x + k, t.y - 15); ctx.lineTo(t.x + k, t.y + 15); ctx.stroke(); }
-      ctx.beginPath(); ctx.moveTo(t.x - 15, t.y - 15); ctx.lineTo(t.x + 15, t.y + 15); ctx.moveTo(t.x + 15, t.y - 15); ctx.lineTo(t.x - 15, t.y + 15); ctx.stroke();
-      const p = 1 - t.buildT / BUILD_TIME;
-      ctx.fillStyle = '#333'; ctx.fillRect(t.x - 15, t.y + 18, 30, 4); ctx.fillStyle = '#c9a25a'; ctx.fillRect(t.x - 15, t.y + 18, 30 * p, 4);
-    } else {
-      rrect(t.x - 14, t.y - 14, 28, 28, 4, t.frozenT > 0 ? '#5aa9d6' : '#8a7350', '#d9c08a');
-      ctx.beginPath(); ctx.arc(t.x, t.y, 6, 0, 7); ctx.fillStyle = '#3b2f1e'; ctx.fill();
-      ctx.fillStyle = '#300'; ctx.fillRect(t.x - 14, t.y + 17, 28, 3); ctx.fillStyle = '#6f6'; ctx.fillRect(t.x - 14, t.y + 17, 28 * t.hp / t.maxHp, 3);
-    }
-  }
-  // enemies
-  for (const e of G.enemies) {
-    ctx.globalAlpha = e.echo ? 0.6 : 1;
-    ctx.beginPath();
-    if (e.type === 'archer') { ctx.moveTo(e.x, e.y + e.r); ctx.lineTo(e.x - e.r, e.y - e.r); ctx.lineTo(e.x + e.r, e.y - e.r); ctx.closePath(); }
-    else if (e.type === 'brute' || e.type === 'commander') ctx.rect(e.x - e.r, e.y - e.r, e.r * 2, e.r * 2);
-    else ctx.arc(e.x, e.y, e.r, 0, 7);
-    ctx.fillStyle = e.echo ? '#38f0ff' : TYPES[e.type].color; ctx.fill();
-    if (e.echo) { ctx.strokeStyle = '#d8fdff'; ctx.lineWidth = 1.5; ctx.stroke(); }
-    if (e.slowT > 0) { ctx.strokeStyle = '#6fc8ff'; ctx.lineWidth = 3; ctx.stroke(); }
-    ctx.globalAlpha = 1;
-    if (e.type === 'commander') txt('COMMANDER', e.x, e.y - e.r - 12, 10, '#38f0ff', 'center', true);
-    if (e.hp < e.maxHp) { ctx.fillStyle = '#400'; ctx.fillRect(e.x - e.r, e.y - e.r - 6, e.r * 2, 3); ctx.fillStyle = '#f55'; ctx.fillRect(e.x - e.r, e.y - e.r - 6, e.r * 2 * e.hp / e.maxHp, 3); }
-  }
-  // tracers
-  for (const t of G.tracers) { ctx.strokeStyle = t.c; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(t.x1, t.y1); ctx.lineTo(t.x2, t.y2); ctx.stroke(); }
-  // walls
-  G.walls.forEach((w, i) => {
-    const x = i * 120 + 4, ww = 112, p = w.hp / WALL_MAX;
-    rrect(x, WALL_Y, ww, WALL_H, 4, w.flash > 0 ? '#ff6b6b' : '#6b6f7a', '#9aa0ad');
-    ctx.fillStyle = p > 0.5 ? '#5fd35f' : p > 0.25 ? '#e8c23b' : '#e84b3b';
-    ctx.fillRect(x + 4, WALL_Y + WALL_H - 6, (ww - 8) * p, 3);
-    txt(Math.ceil(w.hp) + '', x + ww / 2, WALL_Y + 8, 12, '#fff', 'center', true);
-  });
-  // keep
-  rrect(120, 588, 120, 48, 6, '#4a4f5c', '#9aa0ad');
-  txt('KEEP', 180, 612, 13, '#cfd3dc', 'center', true);
-  txt('tap wall = repair (' + REPAIR_COST + ')', 60, 612, 9, '#8892a0', 'center');
-  txt('tower: ' + towerCost() + ' pts', 300, 612, 10, '#8892a0', 'center');
-  // fx
-  for (const f of G.fx) {
-    if (f.type === 'boom') { ctx.globalAlpha = Math.min(1, f.t * 2); ctx.beginPath(); ctx.arc(f.x, f.y, f.r * (1.2 - f.t), 0, 7); ctx.fillStyle = f.color; ctx.globalAlpha *= 0.4; ctx.fill(); ctx.globalAlpha = 1; }
-    if (f.type === 'text') { txt(f.text, f.x, f.y - (0.8 - f.t) * 25, 12, f.color, 'center', true); }
-    if (f.type === 'mend') { ctx.fillStyle = 'rgba(125,255,138,' + f.t * 0.4 + ')'; ctx.fillRect(0, WALL_Y - 4, W, WALL_H + 8); }
-  }
-  // HUD
-  ctx.fillStyle = '#0e1218'; ctx.fillRect(0, 0, W, FIELD_TOP);
-  txt('Day ' + G.day, 10, 16, 14, '#cfd3dc', 'left', true);
-  txt('Wave ' + Math.min(G.wave + 1, WAVES) + '/' + WAVES, 180, 16, 15, '#ffd34d', 'center', true);
-  txt('⬢ ' + G.points + ' pts', 350, 16, 15, '#ffd34d', 'right', true);
-  const status = G.phase === 'break' ? 'Next wave in ' + Math.ceil(G.breakT) + 's — build now!' : 'Wave time ' + Math.floor(G.waveT) + 's';
-  txt(status, 10, 38, 11, '#8892a0');
-  txt('Walls ' + G.walls.map(w => Math.ceil(w.hp)).join(' / '), 350, 38, 11, '#8892a0', 'right');
-  if (!G.echoOn) txt('No Echo today — you are being recorded', 180, 62, 12, '#8892a0', 'center');
-  else if (E.pending) {
-    const lines = wrapLines('Echo targets ' + LN[E.pending.lane] + ': ' + E.pending.reason, 340, 12);
-    lines.slice(0, 2).forEach((l, i) => txt(l, 180, 56 + i * 15, 12, '#38f0ff', 'center', true));
-  } else if (E.target != null && G.phase === 'wave') txt('Echo committed: ' + LN[E.target], 180, 62, 12, '#38f0ff', 'center', true);
-  else txt('Echo of ' + (G.profile.signature) + ' is watching…', 180, 62, 12, '#38f0ff', 'center');
-  // msgs
-  G.msgs.forEach((m, i) => txt(m.text, 180, 110 + i * 18, 13, m.color, 'center', true));
-  // armed hint
-  if (G.armed) txt(G.armed === 'fireball' ? 'Tap the field to drop Fireball' : 'Tap a lane to Freeze it', 180, 530, 13, SPELLS[G.armed].color, 'center', true);
-  // spell bar
-  ctx.fillStyle = '#0e1218'; ctx.fillRect(0, 640, W, 80);
-  SPELL_KEYS.forEach((k, i) => {
-    const r = spellBtnRect(i), S = SPELLS[k], cd = G.spells[k];
-    rrect(r.x, r.y, r.w, r.h, 10, cd > 0 ? '#262b33' : '#2c3542', G.armed === k ? '#fff' : S.color);
-    if (cd > 0) { ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(r.x + 2, r.y + 2, (r.w - 4) * cd / S.cd, r.h - 4); }
-    txt(S.icon + ' ' + S.name, r.x + r.w / 2, r.y + 22, 14, cd > 0 ? '#777' : S.color, 'center', true);
-    txt(cd > 0 ? cd.toFixed(1) + 's' : (k === 'mend' ? 'heal walls' : 'ready'), r.x + r.w / 2, r.y + 43, 11, '#aab', 'center');
-  });
-}
-
-function drawTitle() {
-  txt('ECHO DEFENSE', 180, 120, 34, '#38f0ff', 'center', true);
-  txt('Schwarze Spiele — prototype', 180, 155, 13, '#8892a0', 'center');
-  txt('Day ' + save.day, 180, 215, 24, '#fff', 'center', true);
-  if (save.day === 1 || !save.profile) {
-    ['No Echo yet. Play a run — everything you', 'do is recorded. Tomorrow, your Echo', 'attacks where you are weakest.'].forEach((l, i) => txt(l, 180, 260 + i * 20, 13, '#cfd3dc', 'center'));
-  } else echoCard(250);
-  button('START DAY ' + save.day, 80, 480, 200, 54, () => newRun(), '#2f6df6');
-  button('Reset (clear save)', 100, 560, 160, 40, () => resetAll(), '#5a2a2a');
-  ['Tap empty [+] slot: build archer tower', 'Tap a wall: repair it', 'Spells: Fireball (tap spot), Freeze (tap lane), Mend'].forEach((l, i) => txt(l, 180, 630 + i * 18, 11, '#8892a0', 'center'));
-}
-function echoCard(y) {
-  const p = save.profile;
-  rrect(30, y, 300, 200, 12, '#10262c', '#38f0ff');
-  txt("Today's Echo:", 180, y + 24, 14, '#8fdde6', 'center');
-  txt(p.signature, 180, y + 52, 22, '#38f0ff', 'center', true);
-  p.habits.slice(0, 4).forEach((h, i) => txt('• ' + h.detail, 44, y + 88 + i * 20, 11, '#cfe', 'left'));
-  txt('Echo squads grow each wave; Commander in wave 5.', 180, y + 180, 11, '#8fdde6', 'center');
-}
-function drawEnd() {
-  const r = lastResult;
-  ctx.fillStyle = 'rgba(8,10,14,0.95)'; ctx.fillRect(0, 0, W, H);
-  txt(r.win ? 'VICTORY' : 'DEFEAT', 180, 70, 34, r.win ? '#7dff8a' : '#ff6b6b', 'center', true);
-  txt(r.reason + ' (Day ' + r.day + ', wave ' + Math.min(r.wave, WAVES) + ')', 180, 104, 12, '#cfd3dc', 'center');
-  txt('Why the Echo hit there', 20, 140, 15, '#38f0ff', 'left', true);
-  r.recap.forEach((l, i) => txt(l, 20, 164 + i * 18, 12, '#cfe', 'left'));
-  txt('Your recorded habits', 20, 240, 15, '#ffd34d', 'left', true);
-  const p = r.profile, rec = r.rec;
-  const lines = [
-    'Towers: ' + (rec.towers.length ? rec.towers.map(t => LN[t.lane][0] + '@w' + t.wave).join(' ') : 'none'),
-    'Repairs per lane L/C/R: ' + p.repairCounts.join(' / '),
-    'Avg repair delay L/C/R: ' + p.avgDelay.map(v => v + 's').join(' / '),
-    'Damage taken L/C/R: ' + rec.dmg.map(v => Math.round(v)).join(' / '),
-    'Spells: ' + (rec.spells.length ? Object.entries(p.spellCounts).map(([k, v]) => SPELLS[k].name + ' x' + v).join(', ') : 'none'),
-    p.favSpell ? 'Fav spell ' + SPELLS[p.favSpell].name + ' at ~' + Math.round(p.favSpellPhase * 100) + '% of wave' : 'No favourite spell',
-    'Neglected lane: ' + LN[p.neglectedLane],
-    'Slow-repair lane: ' + (p.slowRepairLane != null ? LN[p.slowRepairLane] : '—'),
-  ];
-  lines.forEach((l, i) => wrapLines(l, 320, 12).slice(0, 1).forEach(s => txt(s, 20, 266 + i * 19, 12, '#cfd3dc')));
-  txt('Signature habit: ' + p.signature, 180, 440, 15, '#38f0ff', 'center', true);
-  button('NEXT DAY ▸', 70, 480, 220, 56, () => nextDay(), '#1f8a9a');
-  button('Reset (clear save)', 100, 555, 160, 40, () => resetAll(), '#5a2a2a');
-  txt('Next Day = overnight refresh: builds your Echo', 180, 620, 11, '#8892a0', 'center');
-}
-function drawCard() {
-  txt('— OVERNIGHT —', 180, 120, 18, '#8892a0', 'center', true);
-  txt('Day ' + save.day, 180, 170, 30, '#fff', 'center', true);
-  echoCard(220);
-  button('START DAY ' + save.day, 80, 480, 200, 54, () => newRun(), '#2f6df6');
-  button('Reset (clear save)', 100, 560, 160, 40, () => resetAll(), '#5a2a2a');
-}
+function arc(r, a0, a1, col, lw) { ctx.beginPath(); ctx.arc(C, C, r, a0 - Math.PI / 2, a1 - Math.PI / 2); ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke(); }
 function draw() {
-  buttons = [];
-  ctx.fillStyle = '#151a22'; ctx.fillRect(0, 0, W, H);
-  if (screen === 'title') drawTitle();
-  else if (screen === 'card') drawCard();
-  else { drawPlay(); if (screen === 'end') drawEnd(); }
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.clearRect(0, 0, WORLD, WORLD);
+  // side wedges + labels, rumor map
+  for (let s = 0; s < SIDES; s++) {
+    const a = sideAng(s);
+    ctx.strokeStyle = '#222a36'; ctx.lineWidth = 1; ctx.beginPath();
+    const p0 = P(TOWER_R + 4, a + SA / 2), p1 = P(SPAWN_R, a + SA / 2); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke();
+    const r = S.rumors[s];
+    if (r) {
+      ctx.beginPath(); ctx.moveTo(C, C); ctx.arc(C, C, 235, a - SA / 2 - Math.PI / 2, a + SA / 2 - Math.PI / 2); ctx.closePath();
+      ctx.fillStyle = r.stale ? 'rgba(140,140,160,0.12)' : 'rgba(255,80,60,0.16)'; ctx.fill();
+      const lp = P(205, a); ctx.fillStyle = r.stale ? '#8a8fa0' : '#ff6b6b'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(r.stale ? 'STALE' : `GAP: ${r.byType}`, lp.x, lp.y);
+    }
+    const lp = P(250, a); ctx.fillStyle = '#5c6779'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(SIDE_NAMES[s], lp.x, lp.y);
+  }
+  // walls
+  for (let s = 0; s < SIDES; s++) {
+    const w = S.walls[s], a = sideAng(s);
+    if (!w.max) { arc(WALL_R, a - SA / 2 + 0.04, a + SA / 2 - 0.04, '#262d39', 3); continue; }
+    if (w.hp <= 0) { ctx.setLineDash([4, 6]); arc(WALL_R, a - SA / 2 + 0.04, a + SA / 2 - 0.04, '#e03131', 3); ctx.setLineDash([]); continue; }
+    const f = w.hp / w.max;
+    arc(WALL_R, a - SA / 2 + 0.04, a + SA / 2 - 0.04, `hsl(${30 + 90 * f},55%,${45 + 10 * f}%)`, 4 + 3 * w.lv);
+  }
+  // turret slots
+  for (let s = 0; s < SIDES; s++) {
+    const p = P(SLOT_R, sideAng(s)), tu = S.slots[s];
+    const sel = S.sel && S.sel.kind === 'slot' && S.sel.i === s;
+    if (!tu) { ctx.beginPath(); ctx.arc(p.x, p.y, 7, 0, 7); ctx.strokeStyle = '#4a5568'; ctx.lineWidth = 2; ctx.stroke(); continue; }
+    if (S.phase !== 'round') { ctx.beginPath(); ctx.arc(p.x, p.y, 95 + 12 * (tu.lv - 1), 0, 7); ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1; ctx.stroke(); }
+    ctx.fillStyle = TT[tu.type].col; ctx.fillRect(p.x - 11, p.y - 11, 22, 22);
+    ctx.strokeStyle = sel ? '#ffd43b' : '#000'; ctx.lineWidth = sel ? 3 : 1.5; ctx.strokeRect(p.x - 11, p.y - 11, 22, 22);
+    ctx.fillStyle = '#111'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText((tu.type === 'basic' ? 'B' : tu.type === 'aa' ? 'AA' : 'AP') + (tu.lv > 1 ? tu.lv : ''), p.x, p.y + 1);
+  }
+  // armies
+  S.armies.forEach((a, i) => {
+    const p = P(ARMY_R, sideAng(a.side)), sel = S.sel && S.sel.kind === 'army' && S.sel.i === i;
+    ctx.beginPath(); ctx.arc(p.x, p.y, ARMY_RANGE, 0, 7); ctx.fillStyle = 'rgba(177,151,252,0.10)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(p.x, p.y, 11, 0, 7);
+    if (a.delay > 0 && S.phase === 'round' || (a.delay > 0 && S.phase === 'between')) { ctx.setLineDash([3, 3]); ctx.strokeStyle = '#b197fc'; ctx.lineWidth = 2; ctx.stroke(); ctx.setLineDash([]); }
+    else { ctx.fillStyle = '#9775fa'; ctx.fill(); }
+    if (sel) { ctx.strokeStyle = '#ffd43b'; ctx.lineWidth = 3; ctx.stroke(); }
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('A', p.x, p.y + 1);
+  });
+  // tower
+  ctx.beginPath(); ctx.arc(C, C, TOWER_R, 0, 7); ctx.fillStyle = '#495057'; ctx.fill();
+  ctx.beginPath(); ctx.moveTo(C, C); ctx.arc(C, C, TOWER_R - 4, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * S.tower / TOWER_MAX); ctx.closePath();
+  ctx.fillStyle = S.tower > 50 ? '#40c057' : S.tower > 25 ? '#fab005' : '#fa5252'; ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(Math.ceil(S.tower), C, C);
+  // shots
+  for (const s of S.shots) { ctx.strokeStyle = s.col; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(s.x1, s.y1); ctx.lineTo(s.x2, s.y2); ctx.stroke(); }
+  // enemies
+  for (const e of S.enemies) {
+    const p = epos(e), t = ET[e.type];
+    ctx.fillStyle = t.col; ctx.beginPath();
+    if (e.type === 'ground') ctx.arc(p.x, p.y, 5, 0, 7);
+    else if (e.type === 'flyer') { ctx.moveTo(p.x, p.y - 7); ctx.lineTo(p.x + 6, p.y + 5); ctx.lineTo(p.x - 6, p.y + 5); ctx.closePath(); }
+    else ctx.rect(p.x - 6, p.y - 6, 12, 12);
+    ctx.fill();
+    if (e.know.size) {
+      const stale = [...e.know].every(s => S.rumors[s] && S.rumors[s].stale);
+      ctx.beginPath(); ctx.arc(p.x, p.y, 10, 0, 7); ctx.strokeStyle = stale ? '#adb5bd' : '#ffd43b'; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.fillStyle = stale ? '#adb5bd' : '#ffd43b'; ctx.font = 'bold 10px sans-serif'; ctx.fillText('!', p.x, p.y - 15);
+    }
+  }
+  // rumor ripples
+  for (const f of S.fx) { ctx.beginPath(); ctx.arc(f.x, f.y, 6 + (RUMOR_R - 6) * f.t / 0.6, 0, 7); ctx.strokeStyle = `rgba(255,212,59,${1 - f.t / 0.6})`; ctx.lineWidth = 2; ctx.stroke(); }
+  // legend
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.font = '11px sans-serif';
+  ctx.fillStyle = '#69db7c'; ctx.fillText('● ground', 6, 548); ctx.fillStyle = '#66d9e8'; ctx.fillText('▲ flyer (ignores walls)', 70, 548);
+  ctx.fillStyle = '#ffa94d'; ctx.fillText('■ armored', 215, 548); ctx.fillStyle = '#ffd43b'; ctx.fillText('◯ knows a gap', 290, 548);
+  ctx.fillStyle = '#9aa6b8'; ctx.fillText('B basic · AA anti-air · AP armor-piercing · A army', 6, 16);
+  if (S.phase === 'won' || S.phase === 'lost') {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, C - 40, WORLD, 80);
+    ctx.fillStyle = S.phase === 'won' ? '#69db7c' : '#ff6b6b'; ctx.font = 'bold 34px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(S.phase === 'won' ? 'TOWER HOLDS — YOU WIN' : 'TOWER FELL', C, C - 8);
+    ctx.font = '14px sans-serif'; ctx.fillStyle = '#fff'; ctx.fillText('Tap Restart to play again', C, C + 22);
+  }
 }
 
 // ================= LOOP =================
-let last = performance.now();
+let last = performance.now(), hudT = 0;
 function frame(now) {
-  let real = Math.min(0.05, (now - last) / 1000); last = now;
-  let sim = real * FAST;
-  try {
-    while (sim > 0) { const s = Math.min(sim, 1 / 60); update(s); sim -= s; }
-    draw();
-  } catch (err) { console.error(err); }
+  let dt = Math.min(0.1, (now - last) / 1000) * FAST; last = now;
+  while (dt > 0) { const st = Math.min(0.05, dt); update(st); dt -= st; }
+  hudT += 1; if (hudT % 10 === 0 && S.phase === 'round') { readout(); $('hud').textContent = `Round ${S.round + 1}/5 · Tower ${Math.ceil(S.tower)}/${TOWER_MAX} · ${S.enemies.length + S.queue.length} left`; }
+  draw();
   requestAnimationFrame(frame);
 }
-requestAnimationFrame(frame);
-// test hooks
-window.ED = { get G() { return G; }, get screen() { return screen; }, get save() { return save; }, tap: onTap, SLOTS, FAST };
+function autoBuild() {
+  newGame();
+  const plan = [[0, 1, 'basic'], [1, 1, 'aa'], [2, 1, 'basic'], [3, 1, null], [4, 1, 'ap'], [5, 1, 'aa'], [6, 1, 'basic'], [7, 1, null]];
+  for (const [s, lv, ty] of plan) { S.walls[s] = { lv, hp: WALL_LV[lv].hp, max: WALL_LV[lv].hp }; S.budget -= WALL_LV[lv].cost; if (ty) { S.slots[s] = { type: ty, lv: 1, cd: 0 }; S.budget -= TT[ty].cost; } }
+  S.msg = `Quick build placed (${BUDGET - S.budget} spent). Adjust or press Start.`; ui();
+}
+// test hook (used by headless tests; harmless in play)
+window.ED = { get S() { return S; }, newGame, autoBuild, startRound, update, tap, repairTower };
+$('restart').onclick = () => { newGame(); };
+newGame(); resize(); requestAnimationFrame(frame);
 </script>
 </body>
 </html>
